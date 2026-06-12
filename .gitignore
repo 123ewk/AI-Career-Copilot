@@ -1,0 +1,102 @@
+# ===== Python 字节码与缓存 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ===== 虚拟环境（uv 默认 .venv，兼容 venv/env） =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 打包与构建产物 =====
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# ===== 工具缓存 =====
+# mypy
+.mypy_cache/
+dmypy.json
+.dmypy.json
+# ruff
+.ruff_cache/
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+# pre-commit
+.pre-commit-cache/
+
+# ===== uv 相关 =====
+# uv.lock 是项目级依赖锁文件，正常情况下应提交；如下需要忽略可取消注释
+# uv.lock
+
+# ===== 环境变量与密钥（绝不能提交） =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*.yaml
+secrets.*.yml
+
+# ===== IDE 与编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ===== 操作系统产物 =====
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+# Linux
+*~
+.fuse_hidden*
+.Trash-*
+
+# ===== 日志与临时文件 =====
+*.log
+*.log.*
+logs/
+tmp/
+temp/
+*.tmp
+
+# ===== 文档构建产物 =====
+docs/_build/
+site/
+.mkdocs/
+
+# ===== Jupyter Notebook =====
+.ipynb_checkpoints/
+*.ipynb
+
+# ===== 大型数据/模型文件（按需启用） =====
+# data/
+# *.csv
+# *.parquet
+# *.pkl
+# *.h5
+# *.pt
+# *.onnx
