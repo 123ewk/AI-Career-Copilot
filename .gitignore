@@ -92,6 +92,36 @@ site/
 .ipynb_checkpoints/
 *.ipynb
 
+# ===== 类型检查与代码覆盖率 =====
+.pyright_cache/
+.mypy_cache/
+dmypy.json
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.cache/
+
+# ===== 前端 / Node =====
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+
+# ===== 数据库与本地数据 =====
+*.db
+*.sqlite
+*.sqlite3
+data/
+uploads/
+downloads/
+storage/
+
 # ===== 大型数据/模型文件（按需启用） =====
 # data/
 # *.csv
