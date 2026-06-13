@@ -1,0 +1,117 @@
+# AI Career Copilot — Docker Compose 编排
+# 使用方式：docker compose up -d
+# 查看日志：docker compose logs -f backend
+# 停止服务：docker compose down
+# 停止并删除数据卷：docker compose down -v
+
+services:
+  # ==================== 后端服务 ====================
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: copilot-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - backend/app/configs/.env
+    # 覆盖 .env 中的本地连接地址，指向 Docker 内部服务名
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      # 挂载上传目录，持久化用户上传的文件
+      - upload_data:/app/uploads
+    networks:
+      - copilot-net
+
+  # ==================== PostgreSQL 数据库 ====================
+  postgres:
+    image: postgres:16-alpine
+    container_name: copilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-copilot_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      # 持久化数据库数据
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready 检查数据库是否就绪，比 TCP 端口检查更可靠
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-copilot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - copilot-net
+
+  # ==================== Redis 缓存 ====================
+  redis:
+    image: redis:7-alpine
+    container_name: copilot-redis
+    restart: unless-stopped
+    # 如需密码认证，取消下行注释并在 .env 中设置 REDIS_PASSWORD
+    # command: redis-server --requirepass ${REDIS_PASSWORD:-}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - copilot-net
+
+  # ==================== RabbitMQ 消息队列 ====================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: copilot-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      # AMQP 协议端口
+      - "5672:5672"
+      # 管理界面端口（浏览器访问 http://localhost:15672）
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # rabbitmq-diagnostics check_port_connectivity 检查 AMQP 端口是否可连接
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - copilot-net
+
+# ==================== 数据卷 ====================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  upload_data:
+    driver: local
+
+# ==================== 网络 ====================
+networks:
+  copilot-net:
+    driver: bridge

@@ -1,0 +1,37 @@
+# ==================== 版本控制 ====================
+.git
+.gitignore
+
+# ==================== IDE 与编辑器 ====================
+.idea
+.vscode
+*.swp
+*.swo
+
+# ==================== Python 缓存 ====================
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+
+# ==================== Node.js / 前端 ====================
+extension/node_modules
+extension/dist
+
+# ==================== Docker 相关 ====================
+docker-compose*.yml
+Dockerfile*
+
+# ==================== 环境与敏感文件 ====================
+.env
+.env.*
+!.env.example
+
+# ==================== 文档与杂项 ====================
+docs/
+*.md
+!README.md
+.trae/
+uploads/
+*.log
