@@ -12,8 +12,10 @@
 """
 
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -26,7 +28,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
+        case_sensitive=False,  # 环境变量不区分大小写
         extra="ignore",
     )
 
@@ -118,6 +120,41 @@ class Settings(BaseSettings):
     # ==================== 文件上传 ====================
     upload_dir: str = "./uploads"
     max_upload_size_mb: int = 10
+
+    # ==================== CORS 跨域 ====================
+    # 精确白名单：Web 前端、第三方回调等固定域名
+    # 环境变量格式：逗号分隔，例如
+    #   CORS_ALLOW_ORIGINS=https://app.example.com,https://admin.example.com
+    cors_allow_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    # 是否放行浏览器扩展来源（chrome/moz/edge-extension://*）
+    # 开发环境默认开启；生产环境建议关闭并配合 X-Extension-ID 二次校验
+    cors_allow_extensions: bool = True
+
+    # 是否允许携带 Cookie / Authorization 等凭据
+    # True 时 allow_origins 不能包含 '*'，否则框架启动报错
+    cors_allow_credentials: bool = True
+
+    # 预检请求（OPTIONS）结果在浏览器侧缓存秒数
+    # 过大：调试期间改 header 需手动清缓存；过小：频繁预检增加延迟
+    cors_max_age_seconds: int = 600
+
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    # 方法上必须加 @classmethod，这是 Pydantic field_validator 的要求
+    def _split_cors_origins(cls, value: object) -> object:
+        """将环境变量中的逗号分隔字符串解析为列表
+
+        为什么需要：
+        - pydantic-settings 默认把 list[str] 字段按 JSON 解析，
+          但运维同事更熟悉逗号分隔的写法（CORS_ALLOW_ORIGINS=a.com,b.com）
+        - 容忍空字符串和 None，避免 .env 留空时启动失败
+        """
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
 
 @lru_cache
