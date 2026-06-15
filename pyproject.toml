@@ -19,6 +19,7 @@ dependencies = [
     "loguru>=0.7.3",
     "mypy>=2.1.0",
     "passlib[bcrypt]>=1.7.4",
+    "pgvector>=0.4.1",
     "pre-commit>=4.6.0",
     "pydantic-settings>=2.14.1",
     "pytest-playwright>=0.8.0",
