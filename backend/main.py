@@ -2,22 +2,25 @@
 
 职责：
 - 创建 FastAPI 应用实例
-- 注册中间件（CORS / 请求日志 / 异常处理 / 限流 / 认证）
+- 注册中间件（CORS / request_id / 异常处理 / 日志 / 限流 / 认证）
 - 挂载路由（auth / user / resume / jobs / match / session / task / agent / workflow）
 - 管理 lifespan（PostgreSQL / Redis / RabbitMQ 连接与断开）
 
 设计动机：
 - 应用工厂模式：将应用创建逻辑封装在函数中，方便测试时替换配置、
-  也方便 uvicorn 以 import 字符串方式引用（uvicorn app.main:app）
+  也方便 uvicorn 以 import 字符串方式引用（uvicorn main:app）
 - lifespan 替代 on_event：FastAPI 官方推荐用 async context manager
   管理启动/关闭生命周期，保证资源获取和释放成对出现
-- 中间件注册顺序：FastAPI 按注册的逆序执行中间件，
-  所以最先注册的中间件最外层（最先进入、最后退出）
+- 中间件注册顺序：FastAPI 按注册顺序"先注册→最外层"执行（参考 Starlette 文档），
+  所以最先注册的中间件最先进入、最先返回
 
 核心机制：
 - lifespan 是 async context manager，yield 前是启动阶段，yield 后是关闭阶段
 - 即使启动阶段抛异常，关闭阶段的资源释放仍需逐个 try/except，
   避免一个资源关闭失败导致其他资源泄漏
+- request_id 中间件必须早于 logging/auth/rate_limit 注册：
+  它把 request_id 写入 contextvars，后续中间件在同一协程内自动可读，
+  这正是它们日志/响应头/限流键能联动 request_id 的前提
 """
 
 from contextlib import asynccontextmanager
@@ -31,8 +34,9 @@ from app.infra.database.postgres import pg_session_factory
 from app.infra.database.redis import redis_client_factory
 from app.infra.message_queue.connection import rabbitmq_connection_factory
 from app.api.middleware.cors import add_cors_middleware
-from app.api.middleware.logging import add_logging_middleware
+from app.api.middleware.request_id import add_request_id_middleware
 from app.api.middleware.exception import add_exception_middleware
+from app.api.middleware.logging import add_logging_middleware
 from app.api.middleware.rate_limit import add_rate_limit_middleware
 from app.api.middleware.auth import add_auth_middleware
 from app.api.routers import auth, user, resume, jobs, match, session, task, agent, workflow
@@ -58,6 +62,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     - on_event(startup/shutdown) 是两个独立函数，无法共享局部变量
     - context manager 天然成对，yield 前后逻辑一目了然
     - FastAPI 官方已标记 on_event 为 deprecated
+
+    启动异常策略：
+    - 当前启动阶段任一步失败会直接抛出，让进程以非零码退出并被 supervisor 重启
+    - 这是"显式失败"策略：宁可让进程崩溃也不要带着半残状态服务请求
+      （例：RabbitMQ 没连上却启动 HTTP，会出现"任务不消费"这种隐蔽故障）
     """
     settings = get_settings()
 
@@ -109,13 +118,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用实例
 
-    中间件注册顺序说明（FastAPI 按逆序执行）：
-    最先注册 → 最外层 → 最先进入/最后退出
+    中间件注册顺序说明（Starlette 规则：先注册 → 最外层 → 最先进入/最后退出）：
     1. CORS        — 跨域预检请求需最先处理，否则后续中间件可能拦截
-    2. 日志        — 记录所有请求的 request_id / 耗时 / 状态码
-    3. 异常处理    — 捕获所有未处理异常，返回统一格式响应
-    4. 限流        — 在认证之前限流，避免恶意请求消耗认证资源
-    5. 认证        — 最内层，只对需要认证的路由生效
+    2. Request ID  — 把 request_id 写入 contextvars，
+                      后续 logging / rate_limit / auth 才能读到同一个 ID
+    3. 异常处理    — 用 add_exception_handler 注册（不是真正的中间件），
+                      位置在 logging 之前，方便异常路径的日志也带 request_id
+    4. 日志        — 记录所有请求的 request_id / 耗时 / 状态码
+    5. 限流        — 在认证之前限流，避免恶意请求消耗认证资源
+    6. 认证        — 最内层，只对需要认证的路由生效
+
+    为什么 request_id 必须在 logging 之前：
+    - logging 通过 logger 自动从 contextvars 读 request_id；
+      若 request_id 中间件晚于 logging 注册，请求全程 logging 都看不到 rid
+    - auth 同理：401 响应要带 X-Request-ID 头，需要从 contextvars 读 rid
+    - rate_limit 同理：429 响应头和日志都需要 rid
+
+    为什么 exception 用 add_exception_handler 而非 BaseHTTPMiddleware：
+    - exception_handler 是 FastAPI 官方推荐方式，不破坏 StreamingResponse
+    - 它在路由层兜底，无法被任何 add_middleware 覆盖
     """
     settings = get_settings()
 
@@ -127,10 +148,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ---- 注册中间件 ----
+    # ---- 注册中间件（按"先注册→最外层"的顺序书写）----
     add_cors_middleware(app)
-    add_logging_middleware(app)
+    add_request_id_middleware(app)
     add_exception_middleware(app)
+    add_logging_middleware(app)
     add_rate_limit_middleware(app)
     add_auth_middleware(app)
 
@@ -149,8 +171,11 @@ def create_app() -> FastAPI:
 
 
 # 模块级应用实例，uvicorn 通过 import 字符串引用
+# 例如：uvicorn main:app --reload
 app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    # 用 import 字符串而非 app 对象，确保 reload 模式下能找到模块路径
+    # （直接传 app 对象时 reload 会报"无法导入 app"）
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
