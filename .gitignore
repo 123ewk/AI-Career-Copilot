@@ -90,6 +90,9 @@ docs/八股文/
 site/
 .mkdocs/
 
+# ===== 临时调试脚本（带 _ 前缀） =====
+backend/_*.py
+
 # ===== Jupyter Notebook =====
 .ipynb_checkpoints/
 *.ipynb
