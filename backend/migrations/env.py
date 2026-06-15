@@ -23,14 +23,15 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.core.settings import get_settings
 from app.infra.database.base import Base
 
-# 此处导入所有 domain models 模块，确保它们的表定义注册到 Base.metadata
+# 导入 ORM Model 包，确保所有表定义注册到 Base.metadata
 # Alembic autogenerate 只能看到已导入的 Model，未导入的表不会出现在迁移脚本中
-# 当新增 domain model 时，需要在此处添加对应的 import
-# from app.domain.user.models import ...  # noqa: F401
-# from app.domain.job.models import ...   # noqa: F401
-# from app.domain.session.models import ...  # noqa: F401
-# from app.domain.resume.models import ...  # noqa: F401
-# from app.domain.workflow.models import ...  # noqa: F401
+# 新增 Model 时只需在 models/__init__.py 中导出，此处无需修改
+from app.infra.database.models import *  # noqa: F401, F403
+
+# pgvector 类型渲染支持
+# Alembic autogenerate 默认不认识 pgvector 的 Vector 类型，
+# 需要注册渲染器，否则生成迁移时报 "Unknown column type" 错误
+from pgvector.sqlalchemy import Vector
 
 config = context.config
 
@@ -49,6 +50,25 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def render_item(type_: str, obj: object, autogen_context: object) -> object | None:
+    """自定义类型渲染器
+
+    Alembic autogenerate 生成迁移脚本时，遇到不认识的列类型会调用此函数。
+    返回 None 表示交给默认渲染器处理。
+
+    为什么需要：
+    - pgvector 的 Vector 类型不在 SQLAlchemy 内置类型中，
+      Alembic 默认无法生成正确的 DDL（如 Vector(1024)）
+    - PG ENUM 的 create_type=False 需要特殊处理，
+      否则 Alembic 可能生成冲突的 CREATE TYPE 语句
+    """
+    if type_ == "type" and isinstance(obj, Vector):
+        # 渲染为 pgvector.sqlalchemy.Vector(dimensions)，保持与 ORM Model 一致
+        return f"Vector({obj.dim})"
+
+    return None
+
+
 def run_migrations_offline() -> None:
     """离线模式运行迁移
 
@@ -61,6 +81,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        render_item=render_item,
     )
 
     with context.begin_transaction():
@@ -75,6 +96,7 @@ def do_run_migrations(connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
+        render_item=render_item,
     )
 
     with context.begin_transaction():
