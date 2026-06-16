@@ -20,7 +20,7 @@
   · exception_handler 是 FastAPI 官方推荐的全局异常处理方式
 - RequestValidationError 必须单独处理：默认返回 422 + 嵌套 list，
   需要拍平为与业务异常一致的结构
-- 必须从 contextvars 读取 request_id（logging 中间件已注入），
+- 必须从 contextvars 读取 request_id（request_id 中间件已注入），
   保证错误响应和日志能通过同一个 ID 关联
 
 潜在风险：
