@@ -5,6 +5,11 @@
 - 仅做数据访问，不做业务校验、不抛业务异常（让 SQLAlchemy 异常冒泡到中间件）
 - 不自动 commit：事务边界由 Service / Router 层显式控制
 
+实现契约：
+- 实现 domain/repositories/user.py 中的 UserRepositoryProtocol
+  → Domain Service 只依赖 Protocol，不接触 SQLAlchemy
+  → 单元测试可替换为 FakeUserRepository，无需拉起真实数据库
+
 设计动机：
 - Repository 模式隔离 ORM 细节：Service 层不直接接触 SQLAlchemy，
   未来切换 ORM 框架（如换成 SQLModel / Tortoise）只改这一层
@@ -39,6 +44,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain.repositories.user import UserRepositoryProtocol
 from app.infra.database.models.user import User
 
 
@@ -57,6 +63,7 @@ class UserRepository:
     - 所有方法均为 async，调用方必须 await
     - 不调用 commit/rollback：让 Service / Router 控制事务边界
     - 异常透传：IntegrityError / OperationalError 等由中间件统一处理
+    - 实现 UserRepositoryProtocol（结构化子类型，无需显式继承）
     """
 
     def __init__(self, session: AsyncSession) -> None:
