@@ -1,4 +1,4 @@
-"""Exception 中间件端到端集成测试
+"""Exception 中间件端到端集成测试（pytest 风格）
 
 测试覆盖：
 1. AppException（业务/基础设施）走自定义 handler
@@ -6,14 +6,15 @@
 3. StarletteHTTPException 走 HTTP handler
 4. 兜底 Exception 走 500 + SYS_000
 5. dev 环境响应体附加 debug 字段
-6. 4xx 响应携带 X-Request-ID 头
-7. 5xx 响应携带 X-Request-ID 头
-8. 错误响应不暴露敏感信息（traceback / 原始 detail）
+6. 4xx/5xx 响应携带 X-Request-ID 头
+7. 错误响应不暴露敏感信息（traceback / 原始 detail）
 """
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
@@ -22,226 +23,223 @@ from app.api.middleware.exception import add_exception_middleware
 from app.api.middleware.request_id import add_request_id_middleware
 from app.core.exceptions import (
     AppException,
-    ValidationError,
     AuthenticationError,
     DatabaseError,
+    ValidationError,
 )
 
 
-# ==================== 测试应用 ====================
+# ==================== Fixtures ====================
 
-app = FastAPI()
-add_exception_middleware(app)
-add_request_id_middleware(app)  # 注入 X-Request-ID
+@pytest.fixture
+def app() -> FastAPI:
+    """构造测试应用：注册 exception + request_id 中间件，定义 8 个端点"""
+    application = FastAPI()
+    add_exception_middleware(application)
+    add_request_id_middleware(application)
 
+    class _UserIn(BaseModel):
+        name: str
+        age: int
 
-class _UserIn(BaseModel):
-    name: str
-    age: int
+    @application.get("/ok")
+    async def ok() -> dict[str, str]:
+        return {"msg": "ok"}
 
+    @application.get("/biz-4xx")
+    async def biz_4xx() -> None:
+        raise ValidationError(detail="邮箱格式错误", extra={"field": "email"})
 
-@app.get("/ok")
-async def ok():
-    """正常端点"""
-    return {"msg": "ok"}
+    @application.get("/biz-401")
+    async def biz_401() -> None:
+        raise AuthenticationError(detail="Token 已过期")
 
+    @application.get("/infra-500")
+    async def infra_500() -> None:
+        raise DatabaseError(detail="数据库连接失败", extra={"host": "pg-1"})
 
-@app.get("/biz-4xx")
-async def biz_4xx():
-    """业务异常 400"""
-    raise ValidationError(detail="邮箱格式错误", extra={"field": "email"})
+    @application.get("/http-404")
+    async def http_404() -> None:
+        raise HTTPException(status_code=404, detail="资源不见了")
 
+    @application.get("/http-401-direct")
+    async def http_401_direct() -> None:
+        raise HTTPException(status_code=401, detail="请登录")
 
-@app.get("/biz-401")
-async def biz_401():
-    """业务异常 401"""
-    raise AuthenticationError(detail="Token 已过期")
+    @application.post("/validate")
+    async def validate(data: _UserIn) -> dict[str, Any]:
+        return {"name": data.name, "age": data.age}
 
+    @application.get("/crash")
+    async def crash() -> None:
+        raise RuntimeError("boom")
 
-@app.get("/infra-500")
-async def infra_500():
-    """基础设施异常 500"""
-    raise DatabaseError(detail="数据库连接失败", extra={"host": "pg-1"})
-
-
-@app.get("/http-404")
-async def http_404():
-    """原生 HTTPException 404"""
-    raise HTTPException(status_code=404, detail="资源不见了")
-
-
-@app.get("/http-401-direct")
-async def http_401_direct():
-    """原生 HTTPException 401（映射表 AUTH_001）"""
-    raise HTTPException(status_code=401, detail="请登录")
-
-
-@app.post("/validate")
-async def validate(data: _UserIn):
-    """Pydantic 校验失败"""
-    return {"name": data.name, "age": data.age}
+    return application
 
 
-@app.get("/crash")
-async def crash():
-    """未处理异常"""
-    raise RuntimeError("boom")
+@pytest.fixture
+def client(app: FastAPI) -> TestClient:
+    """raise_server_exceptions=False 模拟生产模式"""
+    return TestClient(app, raise_server_exceptions=False)
 
 
-# raise_server_exceptions=False 模拟生产模式
-client = TestClient(app, raise_server_exceptions=False)
+# ==================== T1: 正常请求 ====================
 
-
-# ==================== 测试 ====================
-
-def main() -> int:
-    print("=" * 60)
-    print("exception 中间件端到端集成测试")
-    print("=" * 60)
-
-    # ---- T1: 正常请求 200 ----
-    print("\n[T1] 正常 GET /ok -> 200")
+def test_ok_endpoint(client: TestClient) -> None:
+    """T1: 正常 GET /ok → 200"""
     r = client.get("/ok")
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200
     assert r.json() == {"msg": "ok"}
-    print("  PASS")
 
-    # ---- T2: 业务异常 400 (ValidationError) ----
-    print("\n[T2] ValidationError -> 400 | error_code=VAL_001")
+
+# ==================== T2-T4: 业务/基础设施异常 ====================
+
+def test_validation_error_returns_400(client: TestClient) -> None:
+    """T2: ValidationError → 400 | error_code=VAL_001"""
     r = client.get("/biz-4xx")
     body = r.json()
-    assert r.status_code == 400, body
-    assert body["error_code"] == "VAL_001", body
-    assert body["detail"] == "邮箱格式错误", body
-    assert "request_id" in body, body
-    # 响应体不应包含 extra（防止敏感调试信息泄露）
-    assert "extra" not in body, body
-    print(f"  PASS - 400 | error_code={body['error_code']} | detail={body['detail']!r}")
+    assert r.status_code == 400
+    assert body["error_code"] == "VAL_001"
+    assert body["detail"] == "邮箱格式错误"
+    assert "request_id" in body
+    # extra 不写入响应（防泄露）
+    assert "extra" not in body
 
-    # ---- T3: 业务异常 401 (AuthenticationError) ----
-    print("\n[T3] AuthenticationError -> 401 | error_code=AUTH_001")
+
+def test_authentication_error_returns_401(client: TestClient) -> None:
+    """T3: AuthenticationError → 401 | error_code=AUTH_001"""
     r = client.get("/biz-401")
     body = r.json()
-    assert r.status_code == 401, body
-    assert body["error_code"] == "AUTH_001", body
-    assert body["detail"] == "Token 已过期", body
-    print(f"  PASS - 401 | error_code={body['error_code']}")
+    assert r.status_code == 401
+    assert body["error_code"] == "AUTH_001"
+    assert body["detail"] == "Token 已过期"
 
-    # ---- T4: 基础设施异常 500 (DatabaseError) ----
-    print("\n[T4] DatabaseError -> 500 | error_code=DB_001")
+
+def test_database_error_returns_500(client: TestClient) -> None:
+    """T4: DatabaseError → 500 | error_code=DB_001 + dev extra"""
     r = client.get("/infra-500")
     body = r.json()
-    assert r.status_code == 500, body
-    assert body["error_code"] == "DB_001", body
-    # AppException handler 直接使用 exc.detail（调用方传入的值）
-    assert body["detail"] == "数据库连接失败", body
+    assert r.status_code == 500
+    assert body["error_code"] == "DB_001"
+    assert body["detail"] == "数据库连接失败"
     # dev 模式带 extra 字段
-    assert "debug" in body, body
-    assert body["debug"]["extra"] == {"host": "pg-1"}, body
-    print(f"  PASS - 500 | error_code={body['error_code']} | detail={body['detail']!r}")
+    assert "debug" in body
+    assert body["debug"]["extra"] == {"host": "pg-1"}
 
-    # ---- T5: Pydantic 校验失败 422 ----
-    print("\n[T5] Pydantic 校验失败 -> 422 | error_code=VAL_001")
-    # name 缺失 + age 类型错误
+
+# ==================== T5: Pydantic 校验失败 ====================
+
+def test_pydantic_validation_returns_422(client: TestClient) -> None:
+    """T5: Pydantic 校验失败 → 422 | error_code=VAL_001"""
     r = client.post("/validate", json={"age": "not-a-number"})
     body = r.json()
-    assert r.status_code == 422, body
-    assert body["error_code"] == "VAL_001", body
-    # detail 应包含首条错误 + 错误总数
-    assert "项错误" in body["detail"], body
-    assert "request_id" in body, body
-    print(f"  PASS - 422 | error_code={body['error_code']} | detail={body['detail']!r}")
+    assert r.status_code == 422
+    assert body["error_code"] == "VAL_001"
+    assert "项错误" in body["detail"]
+    assert "request_id" in body
 
-    # ---- T6: HTTPException 404 (映射表 RES_001) ----
-    print("\n[T6] HTTPException(404) -> 404 | error_code=RES_001")
+
+# ==================== T6-T8: HTTPException 映射 ====================
+
+def test_http_exception_404_maps_to_res_001(client: TestClient) -> None:
+    """T6: HTTPException(404) → 404 | error_code=RES_001"""
     r = client.get("/http-404")
     body = r.json()
-    assert r.status_code == 404, body
-    assert body["error_code"] == "RES_001", body
-    assert body["detail"] == "资源不见了", body
-    print(f"  PASS - 404 | error_code={body['error_code']}")
+    assert r.status_code == 404
+    assert body["error_code"] == "RES_001"
+    assert body["detail"] == "资源不见了"
 
-    # ---- T7: HTTPException 401 (映射表 AUTH_001) ----
-    print("\n[T7] HTTPException(401) -> 401 | error_code=AUTH_001")
+
+def test_http_exception_401_maps_to_auth_001(client: TestClient) -> None:
+    """T7: HTTPException(401) → 401 | error_code=AUTH_001"""
     r = client.get("/http-401-direct")
     body = r.json()
-    assert r.status_code == 401, body
-    assert body["error_code"] == "AUTH_001", body
-    assert body["detail"] == "请登录", body
-    print(f"  PASS - 401 | error_code={body['error_code']}")
+    assert r.status_code == 401
+    assert body["error_code"] == "AUTH_001"
+    assert body["detail"] == "请登录"
 
-    # ---- T8: HTTPException 405 (映射表 REQ_002) ----
-    print("\n[T8] HTTPException(405) -> 405 | error_code=REQ_002")
+
+def test_http_exception_405_maps_to_req_002(client: TestClient) -> None:
+    """T8: HTTPException(405) → 405 | error_code=REQ_002"""
     r = client.request("PATCH", "/http-404")
     body = r.json()
-    assert r.status_code == 405, body
-    assert body["error_code"] == "REQ_002", body
-    print(f"  PASS - 405 | error_code={body['error_code']}")
+    assert r.status_code == 405
+    assert body["error_code"] == "REQ_002"
 
-    # ---- T9: 兜底未处理异常 -> 500 | SYS_000 ----
-    print("\n[T9] RuntimeError -> 500 | error_code=SYS_000")
+
+# ==================== T9: 兜底异常 ====================
+
+def test_unhandled_exception_returns_500_sys_000(client: TestClient) -> None:
+    """T9: RuntimeError → 500 | error_code=SYS_000 | 不泄露原始异常"""
     r = client.get("/crash")
     body = r.json()
-    assert r.status_code == 500, body
-    assert body["error_code"] == "SYS_000", body
-    assert body["detail"] == "服务内部错误", body
+    assert r.status_code == 500
+    assert body["error_code"] == "SYS_000"
+    assert body["detail"] == "服务内部错误"
     # 不应泄露原始异常信息
-    assert "boom" not in body["detail"], body
-    assert "request_id" in body, body
-    print(f"  PASS - 500 | error_code={body['error_code']} | detail={body['detail']!r}")
+    assert "boom" not in body["detail"]
+    assert "request_id" in body
 
-    # ---- T10: 异常响应携带 X-Request-ID ----
-    print("\n[T10] 5xx 异常响应携带 X-Request-ID")
+
+# ==================== T10-T11: X-Request-ID 透传 ====================
+
+def test_5xx_response_has_x_request_id(client: TestClient) -> None:
+    """T10: 5xx 异常响应携带 X-Request-ID（与请求头透传一致）"""
     custom_rid = "test-exception-rid-aaaa-bbbb"
     r = client.get("/crash", headers={"X-Request-ID": custom_rid})
     assert r.status_code == 500
-    assert r.headers.get("x-request-id") == custom_rid, f"got {r.headers.get('x-request-id')!r}"
+    assert r.headers.get("x-request-id") == custom_rid
     assert r.json()["request_id"] == custom_rid
-    print(f"  PASS - X-Request-ID={custom_rid}")
 
-    # ---- T11: 4xx 响应也携带 X-Request-ID ----
-    print("\n[T11] 4xx 响应也携带 X-Request-ID")
+
+def test_4xx_response_has_x_request_id(client: TestClient) -> None:
+    """T11: 4xx 响应也携带 X-Request-ID"""
     r = client.get("/biz-401", headers={"X-Request-ID": "4xx-rid"})
     assert r.status_code == 401
     assert r.headers.get("x-request-id") == "4xx-rid"
-    print(f"  PASS - X-Request-ID=4xx-rid")
 
-    # ---- T12: dev 环境响应体包含 debug 字段 ----
-    print("\n[T12] dev 环境响应体包含 debug 字段")
+
+# ==================== T12-T14: dev 环境 debug 字段 ====================
+
+def test_dev_response_contains_debug_for_biz_exception(client: TestClient) -> None:
+    """T12: dev 环境响应体包含 debug 字段（业务异常）"""
     r = client.get("/biz-4xx")
     body = r.json()
-    # dev 模式下，AppException 应附加 debug
-    assert "debug" in body, body
-    assert body["debug"]["exc_type"] == "ValidationError", body
-    assert body["debug"]["extra"] == {"field": "email"}, body
-    print(f"  PASS - debug={body['debug']!r}")
+    assert "debug" in body
+    assert body["debug"]["exc_type"] == "ValidationError"
+    assert body["debug"]["extra"] == {"field": "email"}
 
-    # ---- T13: dev 环境 5xx debug 字段含 traceback ----
-    print("\n[T13] dev 环境 5xx 响应 debug.traceback 存在")
+
+def test_dev_5xx_response_contains_traceback(client: TestClient) -> None:
+    """T13: dev 环境 5xx 响应 debug.traceback 存在"""
     r = client.get("/crash")
     body = r.json()
-    assert "debug" in body, body
-    assert "traceback" in body["debug"], body
-    assert "RuntimeError" in body["debug"]["traceback"], body
-    print(f"  PASS - traceback 长度={len(body['debug']['traceback'])}")
+    assert "debug" in body
+    assert "traceback" in body["debug"]
+    assert "RuntimeError" in body["debug"]["traceback"]
 
-    # ---- T14: dev 环境 422 校验响应 debug.errors 存在 ----
-    print("\n[T14] dev 环境 422 响应 debug.errors 存在")
+
+def test_dev_422_response_contains_errors(client: TestClient) -> None:
+    """T14: dev 环境 422 响应 debug.errors 存在"""
     r = client.post("/validate", json={})
     body = r.json()
-    assert "debug" in body, body
-    assert "errors" in body["debug"], body
-    assert isinstance(body["debug"]["errors"], list), body
-    print(f"  PASS - errors 数量={len(body['debug']['errors'])}")
+    assert "debug" in body
+    assert "errors" in body["debug"]
+    assert isinstance(body["debug"]["errors"], list)
 
-    # ---- T15: 错误响应无 WWW-Authenticate 头（auth 中间件的事）----
-    print("\n[T15] exception handler 不注入 WWW-Authenticate（仅 auth 401 才需要）")
+
+# ==================== T15: WWW-Authenticate 头 ====================
+
+def test_biz_401_response_has_no_www_authenticate(client: TestClient) -> None:
+    """T15: exception handler 不注入 WWW-Authenticate（仅 auth 401 才需要）"""
     r = client.get("/biz-401")
     assert "www-authenticate" not in {h.lower() for h in r.headers.keys()}
-    print(f"  PASS")
 
-    # ---- T16: AppException 子类（自定义 status_code）走子类的 status_code ----
-    print("\n[T16] 自定义 AppException 子类映射到自定义状态码")
+
+# ==================== T16: 自定义 AppException 子类 ====================
+
+def test_custom_app_exception_subclass(client: TestClient, app: FastAPI) -> None:
+    """T16: 自定义 AppException 子类映射到自定义 status_code / error_code"""
 
     class _CustomError(AppException):
         status_code = 418  # I'm a teapot
@@ -249,21 +247,11 @@ def main() -> int:
         detail = "我是茶壶"
 
     @app.get("/custom-app-exc")
-    async def custom_app_exc():
+    async def custom_app_exc() -> None:
         raise _CustomError()
 
     r = client.get("/custom-app-exc")
     body = r.json()
-    assert r.status_code == 418, body
-    assert body["error_code"] == "TEA_001", body
-    assert body["detail"] == "我是茶壶", body
-    print(f"  PASS - 418 | error_code={body['error_code']}")
-
-    print("\n" + "=" * 60)
-    print("ALL_TESTS_OK")
-    print("=" * 60)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    assert r.status_code == 418
+    assert body["error_code"] == "TEA_001"
+    assert body["detail"] == "我是茶壶"

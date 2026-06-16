@@ -1,209 +1,195 @@
-"""Auth 中间件端到端集成测试
+"""Auth 中间件端到端集成测试（pytest 风格）
 
-依赖：
-- PyJWT 2.x（项目 .venv 已装）
-- 项目 .env 中应配置 JWT_SECRET_KEY / JWT_ALGORITHM
+测试覆盖（与脚本版一致）：
+- 白名单路径无需 Token
+- 受保护路径的 401 系列（缺失/格式/签名/过期/类型/sub 缺失）
+- 有效 Token 注入 user_id
+- 大小写宽松的 Bearer 前缀
+- 401/200 响应 X-Request-ID 透传
 """
-import sys
-import os
-import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 
 import jwt
-import asyncio
+import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
 from app.api.middleware.auth import add_auth_middleware
+from app.api.middleware.exception import add_exception_middleware
+from app.api.middleware.logging import add_logging_middleware
 from app.api.middleware.rate_limit import add_rate_limit_middleware
 from app.api.middleware.request_id import add_request_id_middleware
-from app.api.middleware.logging import add_logging_middleware
-from app.api.middleware.exception import add_exception_middleware
 from app.core.logger import setup_logging
-from app.core.settings import get_settings
 
-setup_logging()
+if TYPE_CHECKING:
+    from app.core.settings import Settings
 
-# ---- 构造测试应用 ----
-app = FastAPI()
-# 注册顺序按 main.py 约定
-# FastAPI add_middleware 是 LIFO：最后注册的最外层
-add_auth_middleware(app)          # 第一个注册 = 最内层
-add_rate_limit_middleware(app)
-add_exception_middleware(app)
-add_logging_middleware(app)
-add_request_id_middleware(app)    # 最后注册 = 最外层
+pytestmark = pytest.mark.asyncio
 
 
-# 三个端点：
-# /api/auth/login - 白名单
-# /api/auth/refresh - 白名单
-# /api/me - 需鉴权
-# /health - 精确白名单
-@app.get("/api/auth/login")
-async def login():
-    return {"msg": "login ok"}
+# ==================== Fixtures ====================
+
+@pytest.fixture(scope="module", autouse=True)
+def _setup_logging() -> None:
+    """模块级：初始化日志（避免每个测试都重置）"""
+    setup_logging()
 
 
-@app.post("/api/auth/refresh")
-async def refresh():
-    return {"msg": "refresh ok"}
+@pytest.fixture
+def app() -> FastAPI:
+    """每个测试独立的 FastAPI 应用实例
 
-
-@app.get("/api/me")
-async def me(request: Request):
-    # 业务层从 request.state 取用户
-    return {
-        "user_id": getattr(request.state, "user_id", None),
-        "sub_in_payload": request.state.user_payload.get("sub") if hasattr(request.state, "user_payload") else None,
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# ---- 构造测试 JWT ----
-SETTINGS = get_settings()
-SECRET = SETTINGS.jwt_secret_key
-ALG = SETTINGS.jwt_algorithm
-
-
-def make_token(*, sub: str = "user-123", token_type: str = "access",
-               exp_delta: int = 3600, secret: str = None) -> str:
-    """构造一个测试 JWT
-
-    Args:
-        sub: 主题（用户 ID）
-        token_type: access / refresh
-        exp_delta: 距当前时间的过期偏移（秒），负数表示已过期
-        secret: 签名密钥，默认用 settings.jwt_secret_key
+    中间件注册顺序按 main.py 约定（add_middleware 是 LIFO：
+    最后注册的最外层，最先进入请求）
     """
-    payload = {
-        "sub": sub,
-        "type": token_type,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + exp_delta,
-    }
-    return jwt.encode(payload, secret or SECRET, algorithm=ALG)
+    application = FastAPI()
+
+    add_auth_middleware(application)
+    add_rate_limit_middleware(application)
+    add_exception_middleware(application)
+    add_logging_middleware(application)
+    add_request_id_middleware(application)
+
+    @application.get("/api/auth/login")
+    async def login() -> dict[str, str]:
+        return {"msg": "login ok"}
+
+    @application.post("/api/auth/refresh")
+    async def refresh() -> dict[str, str]:
+        return {"msg": "refresh ok"}
+
+    @application.get("/api/me")
+    async def me(request: Request) -> dict[str, str | None]:
+        return {
+            "user_id": getattr(request.state, "user_id", None),
+            "sub_in_payload": request.state.user_payload.get("sub")
+            if hasattr(request.state, "user_payload")
+            else None,
+        }
+
+    @application.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return application
 
 
-# ==================== 测试用例 ====================
-
-async def main() -> int:
-    print("=" * 60)
-    print("auth 中间件端到端集成测试")
-    print("=" * 60)
-    print(f"  ALG = {ALG}")
-    print(f"  SECRET (前 8 字符) = {SECRET[:8]!r}...")
-
+@pytest.fixture
+async def ac(app: FastAPI) -> AsyncGenerator[AsyncClient, None]:
+    """async HTTP 客户端"""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-
-        # ---- T1: 白名单路径（login）无需 token ----
-        print("\n[T1] 白名单 /api/auth/login 无需 Token")
-        r = await ac.get("/api/auth/login")
-        assert r.status_code == 200, f"白名单应 200，实际 {r.status_code}"
-        print(f"  PASS - status={r.status_code}")
-
-        # ---- T2: 白名单路径（refresh）无需 token ----
-        print("\n[T2] 白名单 /api/auth/refresh 无需 Token")
-        r = await ac.post("/api/auth/refresh")
-        assert r.status_code == 200
-        print(f"  PASS - status={r.status_code}")
-
-        # ---- T3: 精确白名单（/health） ----
-        print("\n[T3] 健康检查 /health 无需 Token")
-        r = await ac.get("/health")
-        assert r.status_code == 200
-        print(f"  PASS - status={r.status_code}")
-
-        # ---- T4: 受保护路径无 token → 401 ----
-        print("\n[T4] /api/me 无 Token → 401")
-        r = await ac.get("/api/me")
-        assert r.status_code == 401, f"应为 401，实际 {r.status_code}"
-        body = r.json()
-        assert body["error_code"] == "AUTH_001", body
-        assert "request_id" in body, body
-        assert r.headers.get("www-authenticate") == "Bearer"
-        assert r.headers.get("x-request-id") is not None
-        print(f"  PASS - 401 | error_code=AUTH_001 | WWW-Authenticate=Bearer")
-
-        # ---- T5: Authorization 头格式错误 → 401 ----
-        print("\n[T5] 错误格式 Authorization（缺 Bearer 前缀）→ 401")
-        r = await ac.get("/api/me", headers={"Authorization": "abcdef.token.hijkl"})
-        assert r.status_code == 401
-        print(f"  PASS - 401 | detail={r.json()['detail']!r}")
-
-        # ---- T6: token 签名错误 → 401 ----
-        print("\n[T6] 错误签名 Token → 401")
-        bad_token = make_token(secret="WRONG-SECRET-NOT-THE-REAL-ONE")
-        r = await ac.get("/api/me", headers={"Authorization": f"Bearer {bad_token}"})
-        assert r.status_code == 401
-        body = r.json()
-        assert body["error_code"] == "AUTH_001"
-        print(f"  PASS - 401 | detail={body['detail']!r}")
-
-        # ---- T7: token 过期 → 401 + 明确 detail ----
-        print("\n[T7] 过期 Token → 401 | detail='Token 已过期'")
-        expired_token = make_token(exp_delta=-60)  # 60 秒前就过期了
-        r = await ac.get("/api/me", headers={"Authorization": f"Bearer {expired_token}"})
-        assert r.status_code == 401
-        body = r.json()
-        assert body["detail"] == "Token 已过期", body
-        print(f"  PASS - 401 | detail={body['detail']!r}")
-
-        # ---- T8: refresh token 误用 → 401 ----
-        print("\n[T8] refresh Token 用于普通 API → 401")
-        refresh_token = make_token(token_type="refresh")
-        r = await ac.get("/api/me", headers={"Authorization": f"Bearer {refresh_token}"})
-        assert r.status_code == 401
-        print(f"  PASS - 401 | detail={r.json()['detail']!r}")
-
-        # ---- T9: 有效 access token → 200 + user_id 注入 ----
-        print("\n[T9] 有效 Token → 200 + request.state.user_id 注入")
-        valid_token = make_token(sub="user-42")
-        r = await ac.get("/api/me", headers={"Authorization": f"Bearer {valid_token}"})
-        assert r.status_code == 200, f"应为 200，实际 {r.status_code}: {r.text}"
-        body = r.json()
-        assert body["user_id"] == "user-42", body
-        assert body["sub_in_payload"] == "user-42", body
-        print(f"  PASS - 200 | user_id={body['user_id']!r}")
-
-        # ---- T10: 大小写宽松：bearer 前缀 ----
-        print("\n[T10] 大小写宽松：'bearer xxx' 也能通过")
-        r = await ac.get("/api/me", headers={"Authorization": f"bearer {valid_token}"})
-        assert r.status_code == 200, f"bearer 小写应通过，实际 {r.status_code}"
-        print(f"  PASS - 200")
-
-        # ---- T11: 401 响应包含 X-Request-ID ----
-        print("\n[T11] 401 响应 X-Request-ID 与请求头透传一致")
-        custom_rid = "test-correlation-id-aaaa-bbbb-cccc"
-        r = await ac.get("/api/me", headers={
-            "Authorization": "Bearer x",
-            "X-Request-ID": custom_rid,
-        })
-        assert r.status_code == 401
-        assert r.headers.get("x-request-id") == custom_rid, f"got {r.headers.get('x-request-id')!r}"
-        print(f"  PASS - X-Request-ID={custom_rid!r}")
-
-        # ---- T12: 缺失 sub 声明 → 401 ----
-        print("\n[T12] Token 缺 sub 声明 → 401")
-        token_no_sub = jwt.encode(
-            {"type": "access", "exp": int(time.time()) + 3600},
-            SECRET, algorithm=ALG,
-        )
-        r = await ac.get("/api/me", headers={"Authorization": f"Bearer {token_no_sub}"})
-        assert r.status_code == 401
-        print(f"  PASS - 401")
-
-    print("\n" + "=" * 60)
-    print("ALL_TESTS_OK")
-    print("=" * 60)
-    return 0
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
 
 
-if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+# ==================== T1-T3: 白名单 / 健康检查 ====================
+
+async def test_login_whitelist(ac: AsyncClient) -> None:
+    """T1: /api/auth/login 白名单，无需 Token"""
+    r = await ac.get("/api/auth/login")
+    assert r.status_code == 200
+
+
+async def test_refresh_whitelist(ac: AsyncClient) -> None:
+    """T2: /api/auth/refresh 白名单，无需 Token"""
+    r = await ac.post("/api/auth/refresh")
+    assert r.status_code == 200
+
+
+async def test_health_whitelist(ac: AsyncClient) -> None:
+    """T3: /health 精确白名单"""
+    r = await ac.get("/health")
+    assert r.status_code == 200
+
+
+# ==================== T4-T5: 受保护路径 401 场景 ====================
+
+async def test_protected_no_token_returns_401(ac: AsyncClient) -> None:
+    """T4: /api/me 无 Token → 401 + AUTH_001 + WWW-Authenticate + X-Request-ID"""
+    r = await ac.get("/api/me")
+    assert r.status_code == 401
+    body = r.json()
+    assert body["error_code"] == "AUTH_001"
+    assert "request_id" in body
+    assert r.headers.get("www-authenticate") == "Bearer"
+    assert r.headers.get("x-request-id") is not None
+
+
+async def test_protected_bad_authorization_format(ac: AsyncClient) -> None:
+    """T5: Authorization 头缺 Bearer 前缀 → 401"""
+    r = await ac.get("/api/me", headers={"Authorization": "abcdef.token.hijkl"})
+    assert r.status_code == 401
+
+
+# ==================== T6-T8: Token 校验失败 ====================
+
+async def test_wrong_signature_token(ac: AsyncClient, make_jwt) -> None:
+    """T6: 错误签名 → 401 + AUTH_001"""
+    bad_token = make_jwt(secret="WRONG-SECRET-NOT-THE-REAL-ONE")
+    r = await ac.get("/api/me", headers={"Authorization": f"Bearer {bad_token}"})
+    assert r.status_code == 401
+    assert r.json()["error_code"] == "AUTH_001"
+
+
+async def test_expired_token(ac: AsyncClient, make_jwt) -> None:
+    """T7: 过期 Token → 401 + detail='Token 已过期'"""
+    expired_token = make_jwt(exp_delta=-60)
+    r = await ac.get("/api/me", headers={"Authorization": f"Bearer {expired_token}"})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "Token 已过期"
+
+
+async def test_refresh_token_rejected(ac: AsyncClient, make_jwt) -> None:
+    """T8: refresh token 用于普通 API → 401"""
+    refresh_token = make_jwt(token_type="refresh")
+    r = await ac.get("/api/me", headers={"Authorization": f"Bearer {refresh_token}"})
+    assert r.status_code == 401
+
+
+# ==================== T9-T10: 有效 Token ====================
+
+async def test_valid_access_token(ac: AsyncClient, make_jwt) -> None:
+    """T9: 有效 access token → 200 + user_id 注入"""
+    valid_token = make_jwt(sub="user-42")
+    r = await ac.get("/api/me", headers={"Authorization": f"Bearer {valid_token}"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["user_id"] == "user-42"
+    assert body["sub_in_payload"] == "user-42"
+
+
+async def test_bearer_lowercase(ac: AsyncClient, make_jwt) -> None:
+    """T10: 'bearer xxx' 小写前缀也能通过"""
+    valid_token = make_jwt(sub="user-42")
+    r = await ac.get("/api/me", headers={"Authorization": f"bearer {valid_token}"})
+    assert r.status_code == 200
+
+
+# ==================== T11: X-Request-ID 透传 ====================
+
+async def test_401_x_request_id_passthrough(ac: AsyncClient) -> None:
+    """T11: 401 响应的 X-Request-ID 与请求头一致"""
+    custom_rid = "test-correlation-id-aaaa-bbbb-cccc"
+    r = await ac.get(
+        "/api/me",
+        headers={"Authorization": "Bearer x", "X-Request-ID": custom_rid},
+    )
+    assert r.status_code == 401
+    assert r.headers.get("x-request-id") == custom_rid
+
+
+# ==================== T12: 缺 sub 声明 ====================
+
+async def test_token_missing_sub(ac: AsyncClient, test_settings: "Settings") -> None:
+    """T12: Token 缺 sub 声明 → 401"""
+    token_no_sub = jwt.encode(
+        {"type": "access", "exp": 9_999_999_999},
+        test_settings.jwt_secret_key,
+        algorithm=test_settings.jwt_algorithm,
+    )
+    r = await ac.get("/api/me", headers={"Authorization": f"Bearer {token_no_sub}"})
+    assert r.status_code == 401
