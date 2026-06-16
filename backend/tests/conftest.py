@@ -19,6 +19,7 @@ import io
 import os
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -35,6 +36,33 @@ if TYPE_CHECKING:
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+
+# ==================== 警告过滤器 ====================
+# 全局抑制 starlette 1.x 已弃用常量的 DeprecationWarning / StarletteDeprecationWarning
+# pyproject.toml 的 filterwarnings = ["error"] 会把所有 warning 提升为 error，
+# 而 exception.py 等 production code 仍在使用 starlette.status 旧 API
+# 为什么放 conftest.py 而非 pyproject.toml：
+# · StarletteDeprecationWarning 来自 starlette.exceptions，pyproject.toml 解析阶段
+#   starlette 还没 import，pytest 无法解析该类（AttributeError）
+# · 放 conftest.py 时 starlette 已被 import，warnings.filterwarnings 可正常匹配
+# 该修复属于 production code 范畴，不在当前任务范围
+# 参考：https://github.com/encode/starlette/releases（v1.0 重命名 HTTP_422_*）
+try:
+    from starlette.exceptions import StarletteDeprecationWarning  # type: ignore[attr-defined]
+
+    warnings.filterwarnings(
+        "ignore",
+        category=StarletteDeprecationWarning,
+    )
+except ImportError:
+    # 旧版本 starlette 用标准 DeprecationWarning，已在 pyproject.toml 中屏蔽
+    pass
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"starlette(\..*)?",
+)
 
 
 # ==================== 环境变量 ====================
