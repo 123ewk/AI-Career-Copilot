@@ -73,7 +73,7 @@ class PgSessionFactory:
             pool_timeout=30,
             pool_recycle=1800,
             pool_pre_ping=True,
-            echo=False,
+            echo=False,  # 生产环境不打印 SQL
         )
 
     @property
@@ -97,7 +97,7 @@ class PgSessionFactory:
             self._session_factory = async_sessionmaker(
                 bind=self.engine,
                 class_=AsyncSession,
-                expire_on_commit=False,
+                expire_on_commit=False,  # 生产环境不过期(事务提交后实例缓存是否失效)，避免额外 SELECT
             )
         return self._session_factory
 
