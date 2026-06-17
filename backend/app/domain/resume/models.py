@@ -91,8 +91,8 @@ class EducationItem(BaseModel):
     """
 
     model_config = ConfigDict(
-        extra="forbid",
-        str_strip_whitespace=True,
+        extra="forbid",  # 禁止额外字段
+        str_strip_whitespace=True,  # 去掉字符串首尾空格
     )
 
     school: str = Field(
@@ -314,6 +314,44 @@ class ResumeSummary(BaseModel):
     )
 
 
+class ResumeListResponse(BaseModel):
+    """简历分页列表响应
+
+    字段：
+    - items: 当前页简历摘要（不含 raw_text / structured_data，减少响应体）
+    - total: 该用户简历总数（用于前端分页器计算总页数）
+    - limit: 每页大小（回显给前端，便于校准）
+    - offset: 偏移量（回显给前端，便于校准）
+
+    设计动机：
+    - 显式回显 limit/offset：避免前端"请求 limit=20，响应里看不到"导致误解
+    - 总数 total 独立于 items：列表长度可能 < limit（末页），前端需 total 算总页数
+    - 不缓存列表：列表数据频繁变化（上传/删除），缓存命中率低
+    """
+
+    model_config = {"extra": "forbid"}
+
+    items: list[ResumeSummary] = Field(
+        default_factory=list,
+        description="简历摘要列表",
+    )
+    total: int = Field(
+        ...,
+        ge=0,
+        description="该用户简历总数",
+    )
+    limit: int = Field(
+        ...,
+        ge=1,
+        description="每页大小（回显）",
+    )
+    offset: int = Field(
+        ...,
+        ge=0,
+        description="偏移量（>=0）",
+    )
+
+
 class ResumeResponse(BaseModel):
     """简历完整响应
 
@@ -459,6 +497,7 @@ __all__ = [
     "ResumeSummary",
     "ResumeResponse",
     "ResumeUploadResponse",
+    "ResumeListResponse",
     # 入参
     "ResumeUpdateRequest",
     # 常量（供 Service / Router 复用）
