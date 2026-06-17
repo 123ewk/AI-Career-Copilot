@@ -26,9 +26,10 @@
 """
 
 from collections.abc import AsyncGenerator
+from typing import cast
 
 import aio_pika
-from aio_pika.abc import AbstractRobustConnection
+from aio_pika.abc import AbstractRobustChannel, AbstractRobustConnection
 
 from app.core.settings import get_settings
 
@@ -84,7 +85,7 @@ class RabbitMQConnectionFactory:
             self._connection = await self._build_connection()
         return self._connection
 
-    async def get_channel(self) -> aio_pika.RobustChannel:
+    async def get_channel(self) -> AbstractRobustChannel:
         """获取一个新的 Channel
 
         AMQP Channel 是连接内的轻量级虚拟连接，用于隔离不同业务的消息流。
@@ -96,7 +97,10 @@ class RabbitMQConnectionFactory:
         - Channel 创建开销极小（一次 AMQP 帧），无需池化
         """
         conn = await self.connect()
-        return await conn.channel()
+        # RobustConnection.channel() 运行时实际返回 RobustChannel，
+        # 但 aio-pika 的类型签名声明为 AbstractChannel（缺少覆盖）。
+        # 这里 cast 是为了 mypy 通过，运行时无影响。
+        return cast(AbstractRobustChannel, await conn.channel())
 
     async def close(self) -> None:
         """关闭连接，释放所有 Channel 和资源
@@ -116,7 +120,7 @@ class RabbitMQConnectionFactory:
 rabbitmq_connection_factory = RabbitMQConnectionFactory()
 
 
-async def get_rabbitmq_channel() -> AsyncGenerator[aio_pika.RobustChannel, None]:
+async def get_rabbitmq_channel() -> AsyncGenerator[AbstractRobustChannel, None]:
     """FastAPI 依赖注入：提供 RabbitMQ Channel
 
     每次请求获取独立 Channel，请求结束后关闭。
@@ -129,7 +133,7 @@ async def get_rabbitmq_channel() -> AsyncGenerator[aio_pika.RobustChannel, None]
 
     用法：
         @router.post("/notify")
-        async def notify(ch: RobustChannel = Depends(get_rabbitmq_channel)):
+        async def notify(ch: AbstractRobustChannel = Depends(get_rabbitmq_channel)):
             exchange = await ch.get_exchange("notifications")
             await exchange.publish(Message(body=b"..."), routing_key="email")
             return {"msg": "sent"}

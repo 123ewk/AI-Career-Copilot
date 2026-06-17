@@ -25,9 +25,8 @@
 import json
 from typing import Any
 
-import aio_pika
 from aio_pika import DeliveryMode, Message
-from aio_pika.abc import AbstractRobustChannel, AbstractRobustExchange
+from aio_pika.abc import AbstractExchange, AbstractRobustChannel
 
 from app.core.logger import logger
 
@@ -57,9 +56,9 @@ class MessagePublisher:
         self._channel = channel
         # Exchange 缓存：避免每次发布都调用 get_exchange（一次 AMQP 帧）
         # 键为 exchange 名称，值为已获取的 Exchange 对象
-        self._exchange_cache: dict[str, AbstractRobustExchange] = {}
+        self._exchange_cache: dict[str, AbstractExchange] = {}
 
-    async def _get_exchange(self, exchange_name: str) -> AbstractRobustExchange:
+    async def _get_exchange(self, exchange_name: str) -> AbstractExchange:
         """获取 Exchange（带缓存）
 
         为什么缓存：get_exchange 本质是 Basic.Declare（幂等），
@@ -124,7 +123,7 @@ class MessagePublisher:
 
     async def _publish_with_retry(
         self,
-        exchange: AbstractRobustExchange,
+        exchange: AbstractExchange,
         routing_key: str,
         message: Message,
         max_retries: int,
