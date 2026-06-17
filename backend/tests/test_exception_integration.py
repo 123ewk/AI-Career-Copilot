@@ -31,6 +31,24 @@ from app.core.exceptions import (
 
 # ==================== Fixtures ====================
 
+
+@pytest.fixture(autouse=True)
+def _dev_app_env(monkeypatch: pytest.MonkeyPatch):
+    """本文件所有断言都依赖 dev 环境的 debug 字段
+
+    conftest.py 默认设置 APP_ENV=test,会让 exception 中间件吞掉 debug 字段
+    (见 exception.py: `if get_settings().app_env == "dev"`)
+
+    autouse=True:仅在本文件内生效,不影响其他测试
+    必须清 lru_cache:否则 get_settings() 仍返回旧值
+    """
+    monkeypatch.setenv("APP_ENV", "dev")
+    from app.core.settings import get_settings
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 @pytest.fixture
 def app() -> FastAPI:
     """构造测试应用：注册 exception + request_id 中间件，定义 8 个端点"""
