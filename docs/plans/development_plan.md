@@ -119,6 +119,7 @@
 | 1.5.7 | Resume Service | `domain/resume/service.py` | 上传 → 解析 → 存储 → 查询 |
 | 1.5.8 | Resume Router | `api/routers/resume.py` | POST /upload, GET /, GET /{id} |
 | 1.5.9 | 简历模块测试 | `tests/` | 上传/解析/查询 正常+异常 用例 |
+| 1.5.10 | **Resume 缓存（active resume）** | `domain/cache/resume.py` + `infra/cache/resume.py` + 改造 `domain/resume/service.py` | Cache-Aside 模式,只缓存 active resume。key=`resume:active:{user_id}`,TTL=1800s。读路径:cache.get → miss 走 DB → setex 回填。写路径:upload/set_active/fill_structured_data/delete 完成后 invalidate。fail-open:Redis 异常一律降级到 DB。详见文末「Resume 缓存架构设计」小节 |
 
 **依赖关系**：1.2.3 + 1.4 → 1.5.1~1.5.7（顺序）→ 1.5.8 → 1.5.9
 
@@ -141,8 +142,9 @@
 | 1.6.9 | Agent State 定义 | `runtime/state/agent_state.py` | Agent 运行状态枚举与转换 |
 | 1.6.10 | Job Router | `api/routers/jobs.py` | GET /, POST /analyze, GET /{id}/analysis |
 | 1.6.11 | 岗位模块测试 | `tests/` | 创建/分析/查询 正常+异常 用例 |
+| 1.6.12 | **Job 分析结果缓存（LLM 产物）** | `domain/repositories/job_analysis_cache.py` + `infra/cache/job_analysis_cache.py` + 改造 `domain/job/service.py` | 沿用 Resume 缓存的 **Protocol + Redis + fail-open** 统一模式，只缓存 Job Analysis Agent 的 LLM 产出（推理结果）。key=`job:analysis:{job_id}`，TTL=3600s（分析结果稳定，可设更长）。读路径:cache.get → miss 走 DB → setex 回填。写路径:Agent `COMPLETED` 时直接 setex 覆盖；仅缓存 `completed` 状态结果，`pending`/`failed`/`analyzing` 不缓存。 |
 
-**依赖关系**：1.2.2 + 1.5 → 1.6.1~1.6.7（顺序）→ 1.6.8~1.6.9 → 1.6.10 → 1.6.11
+**依赖关系**：1.2.2 + 1.5 → 1.6.1~1.6.7（顺序）→ 1.6.8~1.6.9 → 1.6.10 → 1.6.11 → 1.6.12
 
 ---
 
@@ -218,8 +220,9 @@
 | 1.10.4 | Agent Router 补充 | `api/routers/agent.py` | POST /chat, POST /task, GET /task/{id} |
 | 1.10.5 | WebSocket 端点 | `api/routers/agent.py` | WS /ws/agent/{session_id} |
 | 1.10.6 | 会话模块测试 | `tests/` | 创建/恢复/销毁/WS 正常+异常 用例 |
+| 1.10.7 | **Session/Task 状态缓存** | `domain/repositories/session_cache.py` + `infra/cache/session_cache.py` + 改造 `domain/session/service.py` | 沿用 **Protocol + Redis + fail-open** 统一模式，缓存 Agent 会话与任务状态（高 WebSocket 轮询场景）。key=`session:state:{session_id}` / `task:state:{task_id}`，TTL=600s（10 分钟，状态机推进频繁）。读路径:cache.get → miss 走 DB → setex 回填。写路径:状态机推进（create/update/complete/fail）后 invalidate。 |
 
-**依赖关系**：1.9 → 1.10.1~1.10.5（顺序）→ 1.10.6
+**依赖关系**：1.9 → 1.10.1~1.10.5（顺序）→ 1.10.6 → 1.10.7
 
 ---
 
@@ -446,6 +449,8 @@ Phase 3（优化）:
 | 简历解析准确率低 | 结构化数据质量差 | 多格式适配 + 人工校验兜底 |
 | 并发安全 | 状态竞争/数据不一致 | 乐观锁 + 状态机约束 |
 | RabbitMQ 不可用 | Agent 任务无法分发 | 连接重试 + 死信队列 + 降级为同步执行 |
+| 缓存击穿 | 高并发下大量请求穿透到 DB | 写后失效 + 30min TTL 兜底 + Redis fail-open 降级 |
+| 缓存与 DB 不一致 | 短暂返回陈旧数据 | TTL 兜底（30min 内自愈）+ 监控命中率 |
 
 ---
 
@@ -543,3 +548,129 @@ infra/message_queue/
 
 - **aio-pika >= 9.5.0**：Python 异步 RabbitMQ 客户端
 - **RabbitMQ Server >= 3.12**：消息代理服务
+
+---
+
+## Resume 缓存架构设计（Step 1.5.10）
+
+### 定位
+
+Resume 缓存是简历域的**读性能优化层**，承担以下职责：
+
+| 职责 | 说明 | 不做什么 |
+|------|------|---------|
+| 加速 `get_active_resume` | 高频热路径，匹配岗位/生成话术都先查 active | 不缓存 list_by_user（命中率低、失效复杂） |
+| 减少 DB 压力 | structured_data 单条可能 50KB，频繁拉取浪费连接 | 不缓存 get_by_id（越权风险、命中率一般） |
+| 写后自愈 | 写操作 invalidate + 30min TTL 兜底 | 不做 Write-Through 同步双写 |
+| Redis 不可用时降级 | fail-open，绝不让缓存抖动变成 5xx | 不抛业务异常、不阻塞请求 |
+
+> 与 RabbitMQ 的关系：RabbitMQ 负责**任务异步分发**（Agent 任务、通知），Redis 负责**热数据缓存**。两者职责互不重叠。
+
+### 数据流
+
+```
+                       ┌─────────────────────┐
+                       │    ResumeService    │
+                       │  (Domain 层编排)    │
+                       └──────────┬──────────┘
+                                  │
+                ┌─────────────────┼─────────────────┐
+                │ get 路径         │ write 路径        │
+                │                 │                  │
+        ┌───────▼──────┐    ┌────▼──────────┐
+        │  Redis 缓存  │    │  Repository   │
+        │  (hit/miss)  │    │  (PostgreSQL) │
+        └───────▲──────┘    └────▲──────────┘
+                │                 │
+                │ miss 时         │ commit
+                │ 回填 setex      │ 后 invalidate
+                └─────────────────┘
+```
+
+### 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 缓存范围 | **仅 active resume** | 命中率最高（每次匹配都查）；list 命中率低、失效复杂 |
+| 缓存模式 | **Cache-Aside（写时删除）** | 简单、几乎无一致性窗口问题；Write-Through 失败难处理 |
+| 缓存粒度 | **ResumeResponse（DTO）而非 ORM** | ORM 有 lazy-load 语义、绑定 session，跨 session 反序列化异常；Pydantic JSON 安全 |
+| Key 设计 | `resume:active:{user_id}` | 命名空间隔离（`resume:active:` 前缀），便于 `KEYS resume:*` 排查 |
+| TTL | **1800s（30min）** | 失效逻辑漏掉时 30min 内自愈；可配（`resume_cache_ttl_seconds`） |
+| 序列化 | `model_dump_json()` / `model_validate_json()` | Pydantic v2 标准方法；自带类型校验 |
+| 失败策略 | **fail-open** | Redis 抖动不应让业务变 5xx；与 rate_limit.py 风格一致 |
+| 失效点 | 4 个写入口（upload/set_active/fill_structured_data/delete） | 任何改变 active 的写操作都要失效 |
+
+### 文件结构
+
+```
+backend/app/
+├── domain/
+│   ├── cache/                     # Domain 层缓存抽象
+│   │   ├── resume.py              # ResumeCacheProtocol（已实现）
+│   │   ├── job.py                 # JobAnalysisCacheProtocol（Step 1.6.12 待实现）
+│   │   ├── match.py               # MatchCacheProtocol（Step 1.7.12 待实现）
+│   │   ├── communication.py       # TemplateCacheProtocol（Step 1.8.11 待实现）
+│   │   └── session.py             # SessionCacheProtocol（Step 1.10.7 待实现）
+│   └── resume/
+│       └── service.py                # Service 协调缓存与 Repository
+└── infra/
+    └── cache/
+        ├── __init__.py
+        └── resume.py                  # Redis 实现（Infra 层）
+```
+
+### 失效矩阵
+
+| 写操作 | 是否需要 invalidate | 说明 |
+|--------|--------------------|------|
+| `upload_resume` | ✅ | 新简历自动激活，旧 active 失效 |
+| `set_active_resume` | ✅ | active 切换，旧 active 失效 |
+| `fill_structured_data` | ✅（统一失效） | 仅当更新的是 active 才必要；统一失效更简单 |
+| `delete_resume` | ✅（统一失效） | 仅当删除的是 active 才必要；统一失效更简单 |
+| `get_resume` / `list_resumes` | — | 读路径，不写 |
+
+### 一致性边界（必须主动承认）
+
+| 场景 | 影响 | 防御 |
+|------|------|------|
+| 写后失效与读穿透竞态 | 写完 DEL，读端正好回查 DB 拿到旧值并 setex | 30min TTL 兜底；业务上简历变更不频繁 |
+| Redis 不可用 | 缓存层静默降级到 DB | logger.warning + 业务不受影响 |
+| 反序列化失败 | 旧 key 格式不匹配 | 当作 miss，下次写入覆盖 |
+| schema 升级 | 旧 key 解析失败 | 同上 |
+
+> 何时升级到 Pub/Sub 广播失效：当真实业务出现"用户投诉看到陈旧数据"且监控命中率异常时再考虑。当前不值得引入。
+
+### 性能预期
+
+| 场景 | 无缓存 | 有缓存 |
+|------|-------|-------|
+| active resume 单次查询 | 10-30ms（含 JSONB 反序列化） | 1-3ms（Redis GET + JSON 反序列化） |
+| 1000 QPS 时 DB QPS | 1000 | ≈10（命中率 99% 时） |
+| 内存占用 | 0 | 50KB × 在线用户数 |
+
+### 监控指标（后续可加）
+
+| 指标 | 采集方式 | 告警阈值 |
+|------|---------|---------|
+| 缓存命中率 | `cache_hit / (cache_hit + cache_miss)` | <80% 告警 |
+| Redis 调用失败率 | `redis_error / redis_call` | >1% 告警 |
+| 平均延迟 | `get_active_resume` p50/p99 | p99 > 50ms 告警 |
+
+### 依赖
+
+- **redis >= 8.0.0**：Python 异步 Redis 客户端（已在 `pyproject.toml` 声明）
+- **Redis Server >= 7.0**：缓存服务（与 Step 1.1.4 共享）
+- 不新增第三方依赖
+
+### 测试覆盖
+
+`backend/tests/test_resume_cache.py`（12 个用例）：
+
+| 类别 | 用例 |
+|------|------|
+| Protocol 校验 | FakeResumeCache 实现 ResumeCacheProtocol |
+| Key 格式 | `resume:active:{uuid}` |
+| Fake cache 行为 | set/get/invalidate/幂等 |
+| Redis 异常容错 | get/set/invalidate 三种异常都不抛 |
+| 反序列化容错 | 非法 JSON 视为 miss |
+| 正确调用 Redis | SETEX 携带 TTL、DEL 用正确 key |
