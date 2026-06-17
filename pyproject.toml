@@ -92,8 +92,11 @@ ignore = [
     "N818",  # 异常类必须以 Error 结尾（项目自定义 BaseException）
     "B904",  # raise from 在 async 上下文中误报，与 E0702 重复
     # 中文文档/注释使用全角符号是项目既定风格（与 main.py / settings.py 一致）
+    "RUF001",
     "RUF002",
     "RUF003",
+    # __all__ 分组带中文分类注释（如「# 连接」「# 消费者」），按语义分组比字母序更有用
+    "RUF022",
 ]
 
 [tool.ruff.lint.per-file-ignores]
