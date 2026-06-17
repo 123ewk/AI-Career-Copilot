@@ -16,7 +16,8 @@
   · Service 显式 rollback,业务失败时回滚
 - 解析复用 tools/file 下的 PDFReader / DOCXReader
   · 不重复实现 PDF/DOCX 文本提取
-  · 与 LangChain 工具(tools/file/resume_parser.py)共用同一批 Reader,保证文本格式一致
+  · Agent 视角的"读简历"通过 tools/file/resume_reader.py 查询 DB,
+    不再二次解析文件
 - 结构化数据(structured_data)由 Agent 后续解析填充
   · 本 Service 只存 raw_text,structured_data 留空 {}
   · Agent 解析完成后通过 fill_structured_data() 回填
@@ -74,8 +75,8 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.logger import logger
-from app.domain.repositories.resume import ResumeRepositoryProtocol
 from app.domain.cache.resume import ResumeCacheProtocol
+from app.domain.repositories.resume import ResumeRepositoryProtocol
 from app.domain.resume.models import (
     PARSE_STATUS_PARSED,
     RESUME_SKILLS_MAX_LENGTH,
