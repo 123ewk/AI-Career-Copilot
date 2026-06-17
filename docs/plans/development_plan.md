@@ -45,10 +45,14 @@
 | 1.1.9 | Loguru 日志初始化 | `core/logger.py` | 结构化日志 + request_id + 文件轮转 |
 | 1.1.10 | 全局异常体系 | `core/exceptions.py` | 基础异常类 + 业务异常 + HTTP 异常映射 |
 | 1.1.11 | 常量定义 | `core/constants.py` | 岗位状态枚举、资历等级、难度等级等 |
-| 1.1.12 | FastAPI 应用工厂 | `main.py` | app 创建、中间件注册、路由挂载、lifespan 管理（含 RabbitMQ 连接/断开） |
+| 1.1.12 | FastAPI 应用工厂 | `main.py` | app 创建、中间件注册、路由挂载、lifespan 管理（含 RabbitMQ 连接/断开、Consumer 启动/停止） |
 | 1.1.13 | Alembic 初始化 | `alembic/` | 迁移框架就绪，`alembic.ini` 配置完成 |
+| 1.1.14 | **Consumer Registry + Lifespan 集成** | `infra/message_queue/registry.py` + 改造 `main.py` | 消费者注册中心：`register(queue_name, handler)`；lifespan startup 自动 `start_all()` 拉起所有 Consumer（asyncio.create_task），shutdown 自动 `stop_all()` 优雅停止。注册信息从 `CONSUMER_REGISTRY` 装饰器收集，避免 main.py 硬编码。 |
+| 1.1.15 | **MQ 基础测试** | `tests/test_message_queue.py` | 覆盖：连接建立/断开、Exchange/Queue 声明幂等性、Publisher 发送+持久化、Consumer 接收+手动 ACK、消息 NACK 重入队列、死信路由。docker-compose 起 RabbitMQ，集成测试标记 `@pytest.mark.integration`。 |
 
-**依赖关系**：1.1.1 → 1.1.2 → 1.1.3/1.1.4/1.1.5（并行）→ 1.1.6/1.1.7/1.1.8（顺序）→ 1.1.9/1.1.10/1.1.11（并行）→ 1.1.12 → 1.1.13
+**依赖关系**：1.1.1 → 1.1.2 → 1.1.3/1.1.4/1.1.5（并行）→ 1.1.6/1.1.7/1.1.8（顺序）→ 1.1.9/1.1.10/1.1.11（并行）→ 1.1.12 → 1.1.13 → 1.1.14 → 1.1.15
+
+> **关键决策（已确认）**：Phase 1 全部 Agent 任务走 MQ 异步分发；Consumer 同进程内 asyncio 协程；前端通过 WebSocket 主动推送获取结果（见 Step 1.10.8 Bridge）。
 
 ---
 
@@ -137,14 +141,19 @@
 | 1.6.4 | LLM Extract Tool | `tools/llm/extract_tool.py` | 封装 LLM 调用，结构化输出 |
 | 1.6.5 | Web Search Tool | `tools/retrieval/web_search.py` | 搜索公司信息补充分析 |
 | 1.6.6 | Job Repository | `domain/repositories/job.py` + `infra/repositories/job_repo.py` | CRUD + 按技能/关键词查询 |
-| 1.6.7 | Job Service | `domain/job/service.py` | 创建岗位 → 触发分析 → 存储结果 |
-| 1.6.8 | Job Analysis Agent | `domain/agent/service.py` | LangGraph 状态机：PARSING → EXTRACTING → ANALYZING → COMPLETED |
+| 1.6.7 | Job Service（异步化） | `domain/job/service.py` | **不再同步执行 Agent**。流程：创建 Job → 创建 Task(status=pending) → Publisher 发送 `agent.task.job_analysis` 消息 → 返回 `{job_id, task_id}`。同步部分仅做参数校验与 Job/Task 落库。RabbitMQ 不可用时降级为同步执行并打 warning。 |
+| 1.6.8 | Job Analysis Agent | `domain/agent/service.py` | LangGraph 状态机：PARSING → EXTRACTING → ANALYZING → COMPLETED（**纯计算函数，被 Consumer 调用**） |
 | 1.6.9 | Agent State 定义 | `runtime/state/agent_state.py` | Agent 运行状态枚举与转换 |
-| 1.6.10 | Job Router | `api/routers/jobs.py` | GET /, POST /analyze, GET /{id}/analysis |
+| 1.6.10 | Job Router | `api/routers/jobs.py` | POST /analyze 返回 `202 Accepted` + `{task_id}`；新增 GET /tasks/{task_id} 查询任务状态 |
 | 1.6.11 | 岗位模块测试 | `tests/` | 创建/分析/查询 正常+异常 用例 |
 | 1.6.12 | **Job 分析结果缓存（LLM 产物）** | `domain/repositories/job_analysis_cache.py` + `infra/cache/job_analysis_cache.py` + 改造 `domain/job/service.py` | 沿用 Resume 缓存的 **Protocol + Redis + fail-open** 统一模式，只缓存 Job Analysis Agent 的 LLM 产出（推理结果）。key=`job:analysis:{job_id}`，TTL=3600s（分析结果稳定，可设更长）。读路径:cache.get → miss 走 DB → setex 回填。写路径:Agent `COMPLETED` 时直接 setex 覆盖；仅缓存 `completed` 状态结果，`pending`/`failed`/`analyzing` 不缓存。 |
+| 1.6.13 | **Task Service（异步任务编排）** | `domain/task/service.py` + `infra/repositories/task_repo.py` | 任务生命周期管理：`create_task(type, payload)`、`mark_running(task_id)`、`mark_completed(task_id, result)`、`mark_failed(task_id, error)`、`get_task(task_id)`、`list_tasks(user_id, status, page)`。Task 表复用 Step 1.2.6。 |
+| 1.6.14 | **Job Analysis Consumer** | `infra/message_queue/handlers/job_analysis.py` | 订阅 `copilot.agent.job_analysis`：1) `mark_running`；2) 调用 Job Analysis Agent（Step 1.6.8）；3) 落库 `Job.analysis_result` + 写缓存（Step 1.6.12）；4) `mark_completed`；5) Publisher 发 `agent.event.completed(task_id, result)`。失败重试 3 次后入死信。注册到 Step 1.1.14 Registry。 |
+| 1.6.15 | **Job 异步流程集成测试** | `tests/test_job_async_flow.py` | 标记 `@pytest.mark.integration`：POST /analyze → 断言 202+task_id → 等待 Consumer 处理 → 断言 Task=completed + Job.analysis_result 非空 + cache 命中 + WebSocket 收到 event 通知（用 test client 模拟 WS）。 |
 
-**依赖关系**：1.2.2 + 1.5 → 1.6.1~1.6.7（顺序）→ 1.6.8~1.6.9 → 1.6.10 → 1.6.11 → 1.6.12
+**依赖关系**：1.2.2 + 1.5 + 1.1.15（MQ 基础就绪）→ 1.6.1~1.6.7（顺序，前 6 个不变，1.6.7 改造为异步）→ 1.6.8~1.6.9 → 1.6.10 → 1.6.11 → 1.6.12 → 1.6.13 → 1.6.14（注册到 1.1.14 Registry）→ 1.6.15
+
+> **MQ 改造点（1.6 第一个落地）**：从此 Step 开始所有 Agent 任务走"API 落库 Task → Publisher 发消息 → Consumer 执行 Agent → Consumer 落结果 → 发完成事件"的标准流水线。下游 1.7/1.8 完全复用该模式。
 
 ---
 
@@ -161,12 +170,13 @@
 | 1.7.5 | LLM Classify Tool | `tools/llm/classify_tool.py` | 技能分类/匹配度评估 |
 | 1.7.6 | RAG Tool | `tools/retrieval/rag_tool.py` | 语义检索相似岗位/简历 |
 | 1.7.7 | Vector Search | `tools/retrieval/vector_search.py` | pgvector 向量检索 |
-| 1.7.8 | Match Service | `domain/match/service.py` | 匹配计算 → 差距分析 → 优化建议 |
-| 1.7.9 | Resume Agent | `domain/agent/service.py` | LangGraph 状态机：PARSING_RESUME → MATCHING → ANALYZING_GAP → GENERATING_SUGGESTIONS |
-| 1.7.10 | Match Router | `api/routers/match.py` | POST /calculate, GET /{job_id} |
+| 1.7.8 | Match Service（异步化） | `domain/match/service.py` | **不再同步执行 Agent**。流程：参数校验 → 创建 Task(type=resume_match) → Publisher 发送 `agent.task.resume_match` 消息 → 返回 `{task_id}`。复用 Step 1.6.13 Task Service。 |
+| 1.7.9 | Resume Agent | `domain/agent/service.py` | LangGraph 状态机：PARSING_RESUME → MATCHING → ANALYZING_GAP → GENERATING_SUGGESTIONS（**纯计算函数，被 Consumer 调用**） |
+| 1.7.10 | Match Router | `api/routers/match.py` | POST /calculate 返回 `202 Accepted` + `{task_id}` |
 | 1.7.11 | 匹配模块测试 | `tests/` | 匹配/排序/建议 正常+异常 用例 |
+| 1.7.12 | **Match Consumer** | `infra/message_queue/handlers/resume_match.py` | 订阅 `copilot.agent.resume_match`：1) mark_running；2) 调用 Resume Agent（Step 1.7.9）；3) 落库 Match 结果；4) mark_completed；5) 发 `agent.event.completed`。注册到 Step 1.1.14 Registry。失败重试 3 次后入死信。 |
 
-**依赖关系**：1.6 → 1.7.1~1.7.8（顺序）→ 1.7.9 → 1.7.10 → 1.7.11
+**依赖关系**：1.6 + 1.6.13（Task Service 复用）→ 1.7.1~1.7.8（顺序，1.7.8 改造为异步）→ 1.7.9 → 1.7.10 → 1.7.11 → 1.7.12
 
 ---
 
@@ -182,12 +192,13 @@
 | 1.8.4 | LLM Rewrite Tool | `tools/llm/rewrite_tool.py` | 个性化改写 |
 | 1.8.5 | PII Filter Tool | `tools/validation/pii_filter.py` | 个人隐私信息过滤 |
 | 1.8.6 | Content Checker Tool | `tools/validation/content_checker.py` | 内容合规检查 |
-| 1.8.7 | Communication Service | `domain/communication/service.py` | 生成 → 合规检查 → PII 过滤 |
-| 1.8.8 | Communication Agent | `domain/agent/service.py` | LangGraph 状态机：GENERATING → COMPLIANCE_CHECK → FILTERING_PII → COMPLETED |
-| 1.8.9 | Communication Router | `api/routers/agent.py` | POST /communication/generate |
+| 1.8.7 | Communication Service（异步化） | `domain/communication/service.py` | **不再同步执行 Agent**。流程：参数校验 → 创建 Task(type=communication) → Publisher 发送 `agent.task.communication` 消息 → 返回 `{task_id}`。复用 Step 1.6.13 Task Service。 |
+| 1.8.8 | Communication Agent | `domain/agent/service.py` | LangGraph 状态机：GENERATING → COMPLIANCE_CHECK → FILTERING_PII → COMPLETED（**纯计算函数，被 Consumer 调用**） |
+| 1.8.9 | Communication Router | `api/routers/agent.py` | POST /communication/generate 返回 `202 Accepted` + `{task_id}` |
 | 1.8.10 | 沟通模块测试 | `tests/` | 生成/合规/过滤 正常+异常 用例 |
+| 1.8.11 | **Communication Consumer** | `infra/message_queue/handlers/communication.py` | 订阅 `copilot.agent.communication`：1) mark_running；2) 调用 Communication Agent（Step 1.8.8）；3) 落库沟通话术；4) mark_completed；5) 发 `agent.event.completed`。注册到 Step 1.1.14 Registry。失败重试 3 次后入死信。 |
 
-**依赖关系**：1.7 → 1.8.1~1.8.7（顺序）→ 1.8.8 → 1.8.9 → 1.8.10
+**依赖关系**：1.7 + 1.6.13 → 1.8.1~1.8.7（顺序，1.8.7 改造为异步）→ 1.8.8 → 1.8.9 → 1.8.10 → 1.8.11
 
 ---
 
@@ -221,8 +232,10 @@
 | 1.10.5 | WebSocket 端点 | `api/routers/agent.py` | WS /ws/agent/{session_id} |
 | 1.10.6 | 会话模块测试 | `tests/` | 创建/恢复/销毁/WS 正常+异常 用例 |
 | 1.10.7 | **Session/Task 状态缓存** | `domain/repositories/session_cache.py` + `infra/cache/session_cache.py` + 改造 `domain/session/service.py` | 沿用 **Protocol + Redis + fail-open** 统一模式，缓存 Agent 会话与任务状态（高 WebSocket 轮询场景）。key=`session:state:{session_id}` / `task:state:{task_id}`，TTL=600s（10 分钟，状态机推进频繁）。读路径:cache.get → miss 走 DB → setex 回填。写路径:状态机推进（create/update/complete/fail）后 invalidate。 |
+| 1.10.8 | **Notification Consumer + WebSocket Bridge** | `infra/message_queue/handlers/notification.py` + `api/realtime/connection_manager.py` + `api/realtime/ws_router.py` | 订阅 `copilot.agent.event.*`（所有 agent 事件 fanout 过来）：1) 从 event payload 解析 user_id；2) 查 ConnectionManager 中该 user 的所有 WS 连接；3) 推送 `{type: "task_completed", task_id, payload}` JSON。ConnectionManager 维护 `user_id → set[WebSocket]` 映射，支持多端登录。WS 端点 `ws://host/ws/agent/{user_id}`，握手时校验 JWT。注册到 Step 1.1.14 Registry。 |
+| 1.10.9 | **MQ + WS 端到端测试** | `tests/test_mq_ws_bridge.py` | 标记 `@pytest.mark.integration`：启动 test server → 模拟 Extension 建立 WS → 触发 Job Analysis 异步流程 → 断言 100ms 内 WS 收到 `task_completed` 事件 + payload 含 result。同时测试多端连接（同一 user 多个 WS 都能收到）。 |
 
-**依赖关系**：1.9 → 1.10.1~1.10.5（顺序）→ 1.10.6 → 1.10.7
+**依赖关系**：1.9 + 1.6.14 + 1.7.12 + 1.8.11（所有 Agent Consumer 都已实现）→ 1.10.1~1.10.7（顺序）→ 1.10.8（必须先有 Agent Consumer 在发事件）→ 1.10.9
 
 ---
 
@@ -415,23 +428,42 @@
 ## 开发依赖关系总览
 
 ```
-Phase 1（MVP 闭环）:
-  1.1 基础设施
+Phase 1（MVP 闭环，MQ 异步化）:
+  1.1 基础设施（含 RabbitMQ + Consumer Registry + MQ 基础测试 1.1.14/15）
     → 1.2 数据模型
       → 1.3 中间件
         → 1.4 用户认证
           → 1.5 简历模块
             → 1.6 岗位 + Job Analysis Agent
+                  ├── 1.6.7  Job Service 异步化（落 Task + 发消息）
+                  ├── 1.6.13 Task Service（异步任务公共组件）
+                  ├── 1.6.14 Job Analysis Consumer（执行 Agent + 发完成事件）
+                  └── 1.6.15 异步流程集成测试
               → 1.7 匹配 + Resume Agent
+                  ├── 1.7.8  Match Service 异步化
+                  └── 1.7.12 Match Consumer
                 → 1.8 沟通 + Communication Agent
+                  ├── 1.8.7  Communication Service 异步化
+                  └── 1.8.11 Communication Consumer
                   → 1.9 投递记录
-                    → 1.10 Agent 会话
+                    → 1.10 Agent 会话 + WS Bridge
+                          ├── 1.10.7  Session/Task 状态缓存
+                          ├── 1.10.8  Notification Consumer + WebSocket Bridge（消费所有 agent.event.*）
+                          └── 1.10.9  MQ + WS 端到端测试
                       → 1.11 Chrome Extension
                         → 1.12 集成测试
+
+  ── MQ 横切关系 ──
+  API 落 Task (1.6.13) → Publisher 发任务消息 → Consumer 执行业务 (1.6.14/1.7.12/1.8.11)
+       → Consumer 发完成事件 → Notification Consumer (1.10.8) → WebSocket 推 Extension
 
 Phase 2（增强）:
   2.1 Agent Runtime 完善（独立，可与 2.2~2.7 并行准备）
   2.2~2.7 各增强模块（依赖 2.1 部分能力）
+  ── Phase 2 新增 MQ 用法 ──
+  2.2.3 Strategy Agent → agent.task.strategy 队列
+  2.3.5 面试提醒       → copilot.notification.email / webhook 队列
+  2.5.2 状态变更推送   → agent.event.* + Notification Consumer
 
 Phase 3（优化）:
   3.1~3.6 各高级功能（依赖 Phase 2）
@@ -448,9 +480,13 @@ Phase 3（优化）:
 | pgvector 性能不足 | 语义检索慢 | 索引优化 + 考虑独立向量库 |
 | 简历解析准确率低 | 结构化数据质量差 | 多格式适配 + 人工校验兜底 |
 | 并发安全 | 状态竞争/数据不一致 | 乐观锁 + 状态机约束 |
-| RabbitMQ 不可用 | Agent 任务无法分发 | 连接重试 + 死信队列 + 降级为同步执行 |
+| RabbitMQ 不可用 | Agent 任务无法分发 | 连接重试（RobustConnection）+ 死信队列 + **降级为同步执行并打 warning**（Service 层 try/except） |
 | 缓存击穿 | 高并发下大量请求穿透到 DB | 写后失效 + 30min TTL 兜底 + Redis fail-open 降级 |
 | 缓存与 DB 不一致 | 短暂返回陈旧数据 | TTL 兜底（30min 内自愈）+ 监控命中率 |
+| **MQ 重复消费** | Agent 被执行多次，结果重复落库 | Consumer 内幂等：Task 进入 running 时检查 status（pending 才推进，否则 ACK 丢弃）；Agent 落库用 `INSERT ... ON CONFLICT DO UPDATE` |
+| **WebSocket 断连导致通知丢失** | 前端错过 task_completed 事件，体验降级 | Notification Consumer 推送失败入 fallback 队列 + Extension 端 `GET /api/tasks/{id}?since=<last_id>` 增量拉取兜底 |
+| **Task 长期 pending（消费者卡死）** | 用户一直看不到结果 | Task 增加 `heartbeat_at` 字段，Consumer 每 30s 刷新；超 5min 无心跳自动 mark_failed 并发告警 |
+| **同进程 Consumer 与 Web 抢资源** | Web 请求延迟升高 | Consumer 限制并发（asyncio.Semaphore=10）+ LLM 调用集中走 httpx 连接池监控 |
 
 ---
 
