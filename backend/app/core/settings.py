@@ -117,6 +117,14 @@ class Settings(BaseSettings):
             return self.deepseek_model
         return self.openai_model
 
+    # ==================== 缓存 ====================
+    # active resume 缓存 TTL(秒)
+    # 默认 30 分钟:即使失效逻辑漏掉,30 分钟后也会自动自愈
+    # 设小(如 60)→ 一致性更好但 DB 压力更大
+    # 设大(如 3600)→ DB 压力更小但陈旧数据窗口更长
+    # 设为 0 → 禁用缓存(用于压测或紧急回滚)
+    resume_cache_ttl_seconds: int = 1800
+
     # ==================== 文件上传 ====================
     upload_dir: str = "./uploads"
     max_upload_size_mb: int = 10
