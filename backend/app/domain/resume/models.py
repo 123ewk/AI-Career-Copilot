@@ -44,7 +44,6 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 # ==================== 常量 ====================
 
 # 简历原文最大长度：50KB，覆盖 95% 简历（正常简历 5-20KB）

@@ -71,7 +71,6 @@ from app.domain.user.models import (
 from app.domain.user.service import UserService
 from app.infra.database.postgres import get_db_session
 
-
 # ==================== Router 实例 ====================
 
 router = APIRouter(

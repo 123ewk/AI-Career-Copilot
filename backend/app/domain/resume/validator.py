@@ -30,7 +30,6 @@ from typing import Final
 
 from app.domain.resume.models import RESUME_RAW_TEXT_MAX_LENGTH
 
-
 # ==================== 常量 ====================
 
 # 支持的简历文件扩展名（白名单）

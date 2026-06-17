@@ -74,7 +74,6 @@ from app.core.settings import get_settings
 from app.domain.resume.models import (
     ResumeListResponse,
     ResumeResponse,
-    ResumeSummary,
     ResumeUploadResponse,
 )
 from app.domain.resume.service import ResumeService
@@ -84,7 +83,6 @@ from app.domain.resume.validator import (
     MAX_FILE_SIZE_BYTES,
 )
 from app.infra.database.postgres import get_db_session
-
 
 # ==================== Router 实例 ====================
 
