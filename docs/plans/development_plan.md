@@ -40,7 +40,7 @@
 | 1.1.4 | Redis 连接 | `infra/database/redis.py` | async Redis 客户端，支持连接池 |
 | 1.1.5 | RabbitMQ 连接管理 | `infra/message_queue/connection.py` | aio-pika RobustConnection，自动重连，单例模式 |
 | 1.1.6 | RabbitMQ Exchange/Queue 声明 | `infra/message_queue/exchanges.py` | 声明所有 Exchange + Queue + 绑定关系 |
-| 1.1.7 | RabbitMQ 消息发布者 | `infra/message_queue/publisher.py` | 统一发送接口，持久化控制，重试机制 |
+| 1.1.7 | RabbitMQ 消息发布者 | `infra/message_queue/publisher.py` | 统一发送接口，持久化控制，**全量 Publisher Confirms**（aio-pika RobustChannel 默认开启 + 显式处理 Nack/超时），**message_id 注入**（业务侧 ID 复用，AMQP `message_id` 字段 + `headers["x-business-id"]`），**`BatchPublishResult` 结构化返回**（`publish_batch` 部分失败不抛异常，调用方按 `has_failure` / `failure_rate` 决策补偿）。指数退避重试 1s → 2s → 4s。**Q9 已完成**。 |
 | 1.1.8 | RabbitMQ 消息消费者 | `infra/message_queue/consumer.py` | 统一订阅接口，ACK/NACK，并发控制 |
 | 1.1.9 | Loguru 日志初始化 | `core/logger.py` | 结构化日志 + request_id + 文件轮转 |
 | 1.1.10 | 全局异常体系 | `core/exceptions.py` | 基础异常类 + 业务异常 + HTTP 异常映射 |
@@ -48,7 +48,7 @@
 | 1.1.12 | FastAPI 应用工厂 | `main.py` | app 创建、中间件注册、路由挂载、lifespan 管理（含 RabbitMQ 连接/断开、Consumer 启动/停止） |
 | 1.1.13 | Alembic 初始化 | `alembic/` | 迁移框架就绪，`alembic.ini` 配置完成 |
 | 1.1.14 | **Consumer Registry + Lifespan 集成** | `infra/message_queue/registry.py` + 改造 `main.py` | 消费者注册中心：`register(queue_name, handler)`；lifespan startup 自动 `start_all()` 拉起所有 Consumer（asyncio.create_task），shutdown 自动 `stop_all()` 优雅停止。注册信息从 `CONSUMER_REGISTRY` 装饰器收集，避免 main.py 硬编码。 |
-| 1.1.15 | **MQ 基础测试** | `tests/test_message_queue.py` | 覆盖：连接建立/断开、Exchange/Queue 声明幂等性、Publisher 发送+持久化、Consumer 接收+手动 ACK、消息 NACK 重入队列、死信路由。docker-compose 起 RabbitMQ，集成测试标记 `@pytest.mark.integration`。 |
+| 1.1.15 | **MQ 基础测试** | `tests/test_message_queue.py` + `tests/test_publisher_confirms.py` | **连接层**：连接建立/断开。**拓扑**：Exchange/Queue 声明幂等性。**Publisher**（`test_publisher_confirms.py`，33 用例）：`publish()` 业务 ID 注入 / UUID 兜底 / `x-business-id` header / JSON 序列化 / PERSISTENT delivery mode / expiration ms→s 转换；Publisher Confirms 成功路径；Nack（`DeliveryError`）重试 + 重试耗尽抛；Confirm 超时（`asyncio.TimeoutError`）重试 + 重试耗尽抛；网络断开等通用异常重试；`publish_batch` 全成功/部分失败/全失败/空批量；`BatchPublishResult` 字段（`success`/`failed`/`has_failure`/`total`/`failure_rate`）与 frozen 不可变；`_extract_business_id` 多 key 优先级 + UUID 兜底；Exchange 缓存。**Consumer**：接收+手动 ACK、消息 NACK 重入队列、死信路由。`@pytest.mark.integration` 标记需 docker-compose 起 RabbitMQ 的集成测试。 |
 
 **依赖关系**：1.1.1 → 1.1.2 → 1.1.3/1.1.4/1.1.5（并行）→ 1.1.6/1.1.7/1.1.8（顺序）→ 1.1.9/1.1.10/1.1.11（并行）→ 1.1.12 → 1.1.13 → 1.1.14 → 1.1.15
 
@@ -562,10 +562,10 @@ API 收到 POST /api/jobs/analyze
 
 ```
 infra/message_queue/
-├── __init__.py          # 包初始化
+├── __init__.py          # 包初始化（导出 MessagePublisher、BatchPublishResult）
 ├── connection.py        # 连接管理（单例、RobustConnection、自动重连）
 ├── exchanges.py         # Exchange/Queue/RoutingKey 定义与声明
-├── publisher.py         # 消息发布者（统一发送接口、持久化、重试）
+├── publisher.py         # 消息发布者（统一发送接口、持久化、Publisher Confirms、message_id 注入、BatchPublishResult 结构化返回、指数退避重试）
 └── consumer.py          # 消息消费者（订阅、ACK/NACK、并发控制）
 ```
 
@@ -579,6 +579,9 @@ infra/message_queue/
 | 死信队列 | 所有业务队列配置 DLX | 失败消息可追溯、可重放，避免静默丢失 |
 | prefetch_count | 10 | 防止消费者一次性拉取过多消息导致内存溢出 |
 | 消息确认 | 手动 ACK | 确保消息处理成功后再确认，失败可重入队列 |
+| **Publisher 可靠性** | **全量 Publisher Confirms（Q9）** | aio-pika `RobustChannel` 默认 `publisher_confirms=True`；`await exchange.publish()` 已等待 Broker `Basic.Ack`，Nack 抛 `DeliveryError`、Confirm 超时走 `asyncio.wait_for(timeout=10s)`。**不使用 AMQP 事务**：吞吐差 10×，且批量中间失败无法回滚 |
+| **Consumer 端幂等** | **message_id 复用业务 ID（Q9）** | 业务侧传 `task_id` / `notification_id` 等唯一 ID，Publisher 写入 AMQP `message_id` + `headers["x-business-id"]`；消费者通过该 ID 去重（与 `MQ 重复消费` 风险防御配合） |
+| **批量发布** | **`BatchPublishResult` 结构化返回（Q9）** | `publish_batch` 不抛异常，返回 `(success: list[str], failed: list[tuple[str, Exception]])`，调用方按 `has_failure` / `failure_rate` 决策补偿 |
 
 ### 依赖
 
