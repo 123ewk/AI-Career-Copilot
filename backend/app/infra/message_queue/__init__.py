@@ -21,7 +21,7 @@ from app.infra.message_queue.consumer import (
     FunctionConsumer,
     MessageConsumer,
 )
-from app.infra.message_queue.publisher import MessagePublisher
+from app.infra.message_queue.publisher import BatchPublishResult, MessagePublisher
 from app.infra.message_queue.registry import (
     CONSUMER_REGISTRY,
     ConsumerManager,
@@ -50,4 +50,5 @@ __all__ = [
     "clear_registry",
     # 发布者
     "MessagePublisher",
+    "BatchPublishResult",
 ]
