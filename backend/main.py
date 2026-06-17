@@ -23,24 +23,25 @@
   这正是它们日志/响应头/限流键能联动 request_id 的前提
 """
 
-from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.middleware.auth import add_auth_middleware
+from app.api.middleware.cors import add_cors_middleware
+from app.api.middleware.exception import add_exception_middleware
+from app.api.middleware.logging import add_logging_middleware
+from app.api.middleware.rate_limit import add_rate_limit_middleware
+from app.api.middleware.request_id import add_request_id_middleware
+from app.api.routers import agent, auth, jobs, match, resume, session, task, user, workflow
 from app.core.logger import logger, setup_logging
 from app.core.settings import get_settings
 from app.infra.database.postgres import pg_session_factory
 from app.infra.database.redis import redis_client_factory
 from app.infra.message_queue.connection import rabbitmq_connection_factory
-from app.api.middleware.cors import add_cors_middleware
-from app.api.middleware.request_id import add_request_id_middleware
-from app.api.middleware.exception import add_exception_middleware
-from app.api.middleware.logging import add_logging_middleware
-from app.api.middleware.rate_limit import add_rate_limit_middleware
-from app.api.middleware.auth import add_auth_middleware
-from app.api.routers import auth, user, resume, jobs, match, session, task, agent, workflow
-
+from app.infra.message_queue.exchanges import declare_all
+from app.infra.message_queue.registry import consumer_manager
 
 # ==================== Lifespan ====================
 
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     2. 连接 PostgreSQL（Engine 创建 + 连接池初始化）
     3. 连接 Redis（连接池初始化 + 健康检查）
     4. 连接 RabbitMQ（RobustConnection 建立 + 自动重连就绪）
+    5. 声明 MQ 拓扑（Exchange / Queue / 重试队列 / 死信队列）
+    6. 启动消费者（从 CONSUMER_REGISTRY 拉起，asyncio.create_task 并发）
 
     关闭阶段（yield 后）：
     按启动的逆序释放资源，每个释放独立 try/except，
@@ -67,6 +70,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     - 当前启动阶段任一步失败会直接抛出，让进程以非零码退出并被 supervisor 重启
     - 这是"显式失败"策略：宁可让进程崩溃也不要带着半残状态服务请求
       （例：RabbitMQ 没连上却启动 HTTP，会出现"任务不消费"这种隐蔽故障）
+
+    关于消费者注册时机：
+    - 装饰器在模块 import 时填充 CONSUMER_REGISTRY
+    - 所有使用 @register 装饰的 consumer 模块必须在本文件顶部 import 进来
+      （或被其他顶部 import 的模块间接 import）
+    - 否则消费者不会在 lifespan 启动时被拉起
     """
     settings = get_settings()
 
@@ -82,8 +91,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _ = redis_client_factory.client
     logger.info("Redis 连接池就绪 | max_connections=20")
 
-    await rabbitmq_connection_factory.connect()
-    logger.info("RabbitMQ 连接就绪 | host={}:{}", settings.rabbitmq_host, settings.rabbitmq_port)
+    # RabbitMQ：建连 + 声明拓扑 + 启动消费者
+    # 这三步必须在同一个 channel 上完成（拓扑声明后才能注册消费者）
+    mq_channel = await rabbitmq_connection_factory.get_channel()
+    logger.info(
+        "RabbitMQ 连接就绪 | host={}:{}",
+        settings.rabbitmq_host,
+        settings.rabbitmq_port,
+    )
+
+    # 声明所有 Exchange/Queue/Binding（幂等）
+    await declare_all(mq_channel)
+    logger.info("RabbitMQ 拓扑声明完成")
+
+    # 启动所有已注册的消费者
+    # ConsumerManager.start_all 内部用 asyncio.create_task 拉起每个消费者
+    # 真正消费消息由 aio-pika 内部事件循环处理，不阻塞 startup
+    await consumer_manager.start_all(mq_channel)
+    if consumer_manager.consumers:
+        logger.info(
+            "消费者已拉起 | count={}",
+            len(consumer_manager.consumers),
+        )
+    else:
+        logger.info("注册表为空，跳过消费者启动")
 
     logger.info("应用启动完成 | app={}", settings.app_name)
 
@@ -92,6 +123,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ---- 关闭阶段（逆序释放）----
     logger.info("应用关闭中，释放资源...")
 
+    # 1. 优雅停止所有消费者（等待 in_flight 归零）
+    try:
+        await consumer_manager.stop_all()
+        logger.info("所有消费者已停止")
+    except Exception:
+        logger.exception("消费者停止异常")
+
+    # 2. 关闭 RabbitMQ 连接（内部会取消所有 consumer 和 channel）
     try:
         await rabbitmq_connection_factory.close()
         logger.info("RabbitMQ 连接已关闭")
