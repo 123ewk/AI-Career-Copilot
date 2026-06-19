@@ -205,6 +205,43 @@ class ExternalServiceError(InfrastructureException):
     detail = "外部服务不可用"
 
 
+# ==================== MQ 消费者控制流异常 ====================
+
+class DuplicateMessageError(Exception):
+    """业务表唯一约束拒绝的重复消息（消费者控制流信号）
+
+    为什么不是 AppException 子类：
+    - 不是 HTTP 错误：消费者内部信号，不返回前端
+    - AppException 体系专用于 API 错误响应（4xx/5xx）
+    - MQ 消费者基类识别此异常后应 ACK 丢弃，**不重试**（重试也是重复）
+
+    使用场景：
+    - MQ 重投导致同 message_id 重复到达（Publisher Confirms + 业务 ACK 竞态）
+    - 业务表已有 unique 约束（如 task_id 主键），INSERT 时被数据库拒绝
+    - 配合 `domain.common.idempotent.insert_idempotent` 使用，业务 INSERT 失败
+      转为此异常，消费者静默 ACK
+
+    业务层使用：
+        try:
+            instance = await insert_idempotent(session, Task, id=task_id, ...)
+        except DuplicateMessageError:
+            return  # 业务正常返回，消费者基类会 ACK
+
+    消费者基类处理（在 MessageConsumer._on_message）：
+        try:
+            await self.handle_message(body)
+            await message.ack()
+        except DuplicateMessageError as e:
+            await message.ack()
+            logger.info("重复消息丢弃", extra={"message_id": e.message_id})
+    """
+
+    def __init__(self, message_id: str, original_error: Exception | None = None) -> None:
+        self.message_id = message_id
+        self.original_error = original_error
+        super().__init__(f"Duplicate message: {message_id}")
+
+
 # ==================== 异常 → HTTP 映射表 ====================
 
 # 中间件可通过此映射快速判断异常类型对应的日志级别
