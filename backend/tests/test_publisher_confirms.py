@@ -432,21 +432,31 @@ async def test_publish_batch_empty_messages_returns_empty_result() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        ({"id": "n-1"}, "n-1"),
+        # 单 key 提取：每个候选 key 都能被识别
+        ({"business_id": "b-1"}, "b-1"),
         ({"task_id": "t-1"}, "t-1"),
         ({"notification_id": "noti-1"}, "noti-1"),
+        ({"id": "n-1"}, "n-1"),
         ({"message_id": "m-1"}, "m-1"),
-        # 优先级：id > task_id > notification_id > message_id
-        ({"id": "first", "task_id": "second"}, "first"),
+        # 优先级：business_id > task_id > notification_id > id > message_id
+        # 业务方传稳定 ID（business_id）优先于 UUID 主键（id）
+        ({"business_id": "first", "task_id": "second"}, "first"),
+        ({"id": "first", "task_id": "second"}, "second"),
         ({"task_id": "second", "notification_id": "third"}, "second"),
+        ({"notification_id": "third", "id": "fourth"}, "third"),
+        ({"id": "fourth", "message_id": "fifth"}, "fourth"),
         # 空值跳过
-        ({"id": "", "task_id": "fallback"}, "fallback"),
+        ({"business_id": "", "task_id": "fallback"}, "fallback"),
         ({"id": None, "task_id": "ok"}, "ok"),
         ({"id": 0, "task_id": "ok"}, "ok"),  # 0 视为空，跳过
     ],
 )
 def test_extract_business_id_priority(payload: dict, expected: str) -> None:
-    """按 _BATCH_ID_KEYS 顺序提取业务 ID，空值跳过"""
+    """按 _BATCH_ID_KEYS 顺序提取业务 ID，空值跳过
+
+    优先级：business_id > task_id > notification_id > id > message_id
+    与 app.domain.common.idempotent._ID_KEYS 保持完全一致
+    """
     assert MessagePublisher._extract_business_id(payload) == expected
 
 
