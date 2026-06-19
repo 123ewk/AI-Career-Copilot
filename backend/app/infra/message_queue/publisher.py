@@ -60,7 +60,18 @@ DEFAULT_CONFIRM_TIMEOUT_S = 10.0
 
 # 批量发布中从 payload 提取业务 ID 的候选 key 列表（按优先级）
 # 业务方传 payload 时应保证其中之一存在，否则 publisher 兜底生成 UUID
-_BATCH_ID_KEYS: tuple[str, ...] = ("id", "task_id", "notification_id", "message_id")
+# 为什么 business_id 排第一：
+# - business_id 是业务方传入的稳定 ID，专门用于 MQ 幂等
+# - id 在 Task 等表中是 UUID PK（每次新生成），不参与业务去重
+# 提取顺序：business_id > task_id > notification_id > id > message_id
+# 与 app.domain.common.idempotent._ID_KEYS 保持完全一致
+_BATCH_ID_KEYS: tuple[str, ...] = (
+    "business_id",
+    "task_id",
+    "notification_id",
+    "id",
+    "message_id",
+)
 
 
 @dataclass(frozen=True)
