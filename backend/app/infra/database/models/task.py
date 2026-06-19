@@ -24,6 +24,17 @@
 - ix_tasks_status：按状态筛选，如查所有 RUNNING 任务
 - ix_tasks_created_at：按创建时间排序
 - ix_tasks_updated_at：按更新时间排序，支持超时检测
+- uq_tasks_user_business：联合唯一索引（user_id, business_id），保证 MQ 重投幂等
+  · 业务方传入稳定的 business_id（如 "analyze_jd:job-uuid-123"）
+  · 同一用户对同一业务 ID 只能存在一条 Task 记录
+  · 配合 app/domain/common/idempotent.py 的 insert_idempotent 使用，
+    重复 INSERT 触发 IntegrityError → DuplicateMessageError → 消费者静默 ACK
+  · 为什么需要 user_id 维度的隔离：避免多用户业务 ID 冲突（如都传 "default-task"）
+
+幂等消费前置条件：
+- 调用方必须在创建 Task 时传入 business_id（不可为 NULL）
+- 推荐 business_id 命名：f"{task_type}:{business_key}"，如 "analyze_jd:job-uuid-123"
+- 业务 ID 必须是稳定的：同一业务操作重试时 ID 必须一致
 """
 
 import uuid
@@ -94,11 +105,33 @@ class Task(Base):
         comment="任务ID，UUID v4",
     )
 
+    # 所属用户：冗余字段（已有 session_id → user_id 关联链）
+    # 为什么冗余：
+    # - (user_id, business_id) 联合唯一索引必须 user_id 直接在 tasks 表上
+    # - 否则联合索引要 join sessions 才能确认唯一性，DB 索引无法跨表
+    # - ON DELETE CASCADE：用户注销时任务一并清理（与 session_id 级联链一致）
+    # 写入一致性：Service 层必须在创建 Task 时从 session_id 同步 user_id
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="所属用户ID（冗余自 sessions.user_id，用于业务幂等唯一约束）",
+    )
+
     # 所属会话：级联删除，会话销毁时任务一并清理
     session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("sessions.id", ondelete="CASCADE"),
         nullable=False,
         comment="所属会话ID",
+    )
+
+    # 业务 ID：调用方传入的稳定标识，用于 MQ 重投幂等
+    # 命名建议：f"{task_type}:{business_key}"，如 "analyze_jd:job-uuid-123"
+    # 长度 100：覆盖命名建议 + UUID/雪花 ID + 业务前缀
+    # NOT NULL：业务方必须显式传入，未传则违反契约
+    business_id: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="业务ID，业务方传入的稳定标识，MQ重投幂等键",
     )
 
     # 任务类型：标识 Agent 执行的具体操作
@@ -171,6 +204,20 @@ class Task(Base):
         Index("ix_tasks_created_at", "created_at"),
         # 更新时间索引：支持超时检测（WHERE status = 'RUNNING' AND updated_at < now() - interval '5 min'）
         Index("ix_tasks_updated_at", "updated_at"),
+        # 联合唯一索引：MQ 幂等消费的前置条件
+        # 同一用户对同一 business_id 只能存在一条 Task
+        # MQ 重投（Publisher Confirms 竞态 / Consumer 崩溃在 commit 后 ACK 前）触发 unique 冲突
+        # → IntegrityError → DuplicateMessageError → 消费者静默 ACK
+        # 为什么需要 user_id 维度：多用户环境下避免 business_id 冲突
+        # （如不同用户都传 "default-task" 这种简单 ID）
+        Index(
+            "uq_tasks_user_business",
+            "user_id",
+            "business_id",
+            unique=True,
+        ),
+        # 普通索引：按用户查任务列表（数据权限隔离场景）
+        Index("ix_tasks_user_id", "user_id"),
     )
 
     def __repr__(self) -> str:
