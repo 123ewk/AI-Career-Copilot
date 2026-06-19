@@ -37,6 +37,7 @@ dependencies = [
     "httpx2>=2.4.0",
     "pypdf>=6.13.2",
     "python-docx>=1.2.0",
+    "python-multipart>=0.0.32",
 ]
 
 # ==================== Dev 依赖 ====================
