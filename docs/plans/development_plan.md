@@ -1,17 +1,57 @@
 # Agentic Job Copilot - 开发顺序规划
 
-> 版本：v1.0.0
-> 日期：2026-06-13
+> 版本：v1.1.0
+> 日期：2026-06-17
 > 基于 PRD v1.0.0 制定
+> 最近更新：v1.1.0 — 补完 Q9 业务幂等键（Task.business_id + 联合 unique + 静默 ACK）；新增 Step 1.16 业务 MQ 接入专题；更新决策表与风险表
 
 ---
 
-## 当前项目状态
+## 当前项目状态（v1.1.0）
 
-- **目录骨架**：已搭建完成（后端 6 层架构 + Extension 4 模块）
-- **核心代码**：大部分文件为空壳，`main.py` 仅有 Hello World
-- **依赖**：`pyproject.toml` 已配置，`package.json` 已配置
-- **数据库**：未初始化，无迁移脚本
+### 基础设施层 ✅ 已完成
+
+- **目录骨架**：后端 6 层架构 + Extension 4 模块
+- **核心代码**：
+  - `core/`（settings / logger / exceptions / constants）：完整
+  - `infra/database/`（postgres / redis / models）：完整
+  - `infra/message_queue/`（connection / exchanges / publisher / consumer / registry）：完整
+  - `infra/cache/`（resume / session 模式）：已建立 Protocol + Redis 模式
+  - `main.py`：lifespan + 路由挂载
+  - 依赖：`pyproject.toml` 已配置
+- **数据库**：Alembic 框架就绪；首次迁移 `c528168c702d`（init） + Q9 迁移 `a1b2c3d4e5f6`（Task 业务唯一键）已就绪
+- **MQ 拓扑**：copilot.agent.topic / copilot.task.direct / copilot.notification.fanout / copilot.dead_letter.exchange + 重试队列
+
+### 业务层 ⚠️ 已搭脚手架但未接入
+
+- `domain/*/service.py`：**全部为占位**（最大 799 bytes，全是注释 / 无函数体）
+- `api/routers/*`：**除 auth/user 外基本为空 router**
+- `@register("queue.x")` 装饰器：**0 处业务使用**（registry.py 本身已就绪）
+- 业务层与 MQ 组合：**0 处调用 MessagePublisher**
+
+### MQ 单元测试 ✅ 65+ 用例
+
+- `test_publisher_confirms.py`（≥33）：Publisher Confirms 全部场景
+- `test_consumer_idempotency.py`（≥8）：`DuplicateMessageError` 静默 ACK
+- `test_consumer_retry.py`：重试 + DLQ
+- `test_consumer_registry.py`：`@register` + ConsumerManager
+- `test_exchanges_topology.py`：Exchange/Queue 拓扑
+- `test_task_business_unique.py`（**Q9 新增 13 个**）：Task `(user_id, business_id)` 联合 unique + `insert_idempotent` + MQ 重投端到端
+
+### 关键里程碑（Q1-Q9）
+
+| 里程碑 | 主题 | 状态 | 关键交付 |
+|--------|------|------|---------|
+| Q1 | 基础设施 | ✅ 完成 | Settings / DB / Redis / Logger / Exceptions |
+| Q2 | RabbitMQ 接入 | ✅ 完成 | Connection / Topology / Consumer / Registry |
+| Q3 | ORM Model + 迁移 | ✅ 完成 | 7 张表 + init 迁移 |
+| Q4 | 中间件层 | ✅ 完成 | CORS / Exception / Logging / Request ID / Rate Limit / Auth |
+| Q5 | 认证模块 | ⚠️ 骨架 | service.py 占位，router 待实现 |
+| Q6 | 简历模块 | ⚠️ 骨架 | Parser 待集成；缓存模式已建立 |
+| Q7 | 缓存模式 | ✅ 完成 | Resume / Job / Session / Match / Communication 五模块 Protocol + Redis 模式 |
+| Q8 | Publisher Confirms | ✅ 完成 | 33+ 用例，Nack/超时/重试/批量全覆盖 |
+| **Q9** | **业务幂等消费** | **✅ 完成** | **`DuplicateMessageError` + `insert_idempotent` + Task `(user_id, business_id)` 联合 unique + 消费者基类静默 ACK + 13 个新测试** |
+| Q10 | 业务 MQ 接入 | 🔴 未开始 | 见 [Step 1.16](#step-116---业务-mq-接入q9-关键收口) |
 
 ---
 
@@ -40,15 +80,15 @@
 | 1.1.4 | Redis 连接 | `infra/database/redis.py` | async Redis 客户端，支持连接池 |
 | 1.1.5 | RabbitMQ 连接管理 | `infra/message_queue/connection.py` | aio-pika RobustConnection，自动重连，单例模式 |
 | 1.1.6 | RabbitMQ Exchange/Queue 声明 | `infra/message_queue/exchanges.py` | 声明所有 Exchange + Queue + 绑定关系 |
-| 1.1.7 | RabbitMQ 消息发布者 | `infra/message_queue/publisher.py` | 统一发送接口，持久化控制，**全量 Publisher Confirms**（aio-pika RobustChannel 默认开启 + 显式处理 Nack/超时），**message_id 注入**（业务侧 ID 复用，AMQP `message_id` 字段 + `headers["x-business-id"]`），**`BatchPublishResult` 结构化返回**（`publish_batch` 部分失败不抛异常，调用方按 `has_failure` / `failure_rate` 决策补偿）。指数退避重试 1s → 2s → 4s。**Q9 已完成**。 |
-| 1.1.8 | RabbitMQ 消息消费者 | `infra/message_queue/consumer.py` | 统一订阅接口，ACK/NACK，并发控制 |
+| 1.1.7 | RabbitMQ 消息发布者 | `infra/message_queue/publisher.py` | 统一发送接口，持久化控制，**全量 Publisher Confirms**（aio-pika RobustChannel 默认开启 + 显式处理 Nack/超时），**message_id 注入**（业务侧 ID 复用，AMQP `message_id` 字段 + `headers["x-business-id"]`，**`_BATCH_ID_KEYS` 提取顺序 `business_id > task_id > notification_id > id > message_id`**），**`BatchPublishResult` 结构化返回**（`publish_batch` 部分失败不抛异常，调用方按 `has_failure` / `failure_rate` 决策补偿）。指数退避重试 1s → 2s → 4s。**Q9 已完成**。 |
+| 1.1.8 | RabbitMQ 消息消费者 | `infra/message_queue/consumer.py` | 统一订阅接口，ACK/NACK，并发控制。**基类 `_on_message` 捕获 `DuplicateMessageError`（来自 Step 1.1.10）→ 静默 ACK + INFO 日志**（Q9 幂等消费关键路径）。**Q9 已完成**。 |
 | 1.1.9 | Loguru 日志初始化 | `core/logger.py` | 结构化日志 + request_id + 文件轮转 |
-| 1.1.10 | 全局异常体系 | `core/exceptions.py` | 基础异常类 + 业务异常 + HTTP 异常映射 |
+| 1.1.10 | 全局异常体系 | `core/exceptions.py` | 基础异常类 + 业务异常 + HTTP 异常映射。**新增 `DuplicateMessageError` 异常**（继承 `Exception`，不混入 `AppException` 体系）：业务表 unique 约束拒绝的重复消息时抛出，**消费者基类识别后静默 ACK，不重试**。携带 `message_id` + `original_error` 用于日志排查。**Q9 已完成**。 |
 | 1.1.11 | 常量定义 | `core/constants.py` | 岗位状态枚举、资历等级、难度等级等 |
 | 1.1.12 | FastAPI 应用工厂 | `main.py` | app 创建、中间件注册、路由挂载、lifespan 管理（含 RabbitMQ 连接/断开、Consumer 启动/停止） |
 | 1.1.13 | Alembic 初始化 | `alembic/` | 迁移框架就绪，`alembic.ini` 配置完成 |
 | 1.1.14 | **Consumer Registry + Lifespan 集成** | `infra/message_queue/registry.py` + 改造 `main.py` | 消费者注册中心：`register(queue_name, handler)`；lifespan startup 自动 `start_all()` 拉起所有 Consumer（asyncio.create_task），shutdown 自动 `stop_all()` 优雅停止。注册信息从 `CONSUMER_REGISTRY` 装饰器收集，避免 main.py 硬编码。 |
-| 1.1.15 | **MQ 基础测试** | `tests/test_message_queue.py` + `tests/test_publisher_confirms.py` | **连接层**：连接建立/断开。**拓扑**：Exchange/Queue 声明幂等性。**Publisher**（`test_publisher_confirms.py`，33 用例）：`publish()` 业务 ID 注入 / UUID 兜底 / `x-business-id` header / JSON 序列化 / PERSISTENT delivery mode / expiration ms→s 转换；Publisher Confirms 成功路径；Nack（`DeliveryError`）重试 + 重试耗尽抛；Confirm 超时（`asyncio.TimeoutError`）重试 + 重试耗尽抛；网络断开等通用异常重试；`publish_batch` 全成功/部分失败/全失败/空批量；`BatchPublishResult` 字段（`success`/`failed`/`has_failure`/`total`/`failure_rate`）与 frozen 不可变；`_extract_business_id` 多 key 优先级 + UUID 兜底；Exchange 缓存。**Consumer**：接收+手动 ACK、消息 NACK 重入队列、死信路由。`@pytest.mark.integration` 标记需 docker-compose 起 RabbitMQ 的集成测试。 |
+| 1.1.15 | **MQ 基础测试** | `tests/test_message_queue.py` + `tests/test_publisher_confirms.py` + `tests/test_consumer_idempotency.py` + `tests/test_task_business_unique.py` + `tests/test_consumer_retry.py` + `tests/test_consumer_registry.py` + `tests/test_exchanges_topology.py` | **连接层**：连接建立/断开。**拓扑**：Exchange/Queue 声明幂等性。**Publisher**（`test_publisher_confirms.py`，≥33 用例）：`publish()` 业务 ID 注入 / `_BATCH_ID_KEYS` 优先级 `business_id > task_id > notification_id > id > message_id` / UUID 兜底 / `x-business-id` header / JSON 序列化 / PERSISTENT delivery mode / expiration ms→s 转换；Publisher Confirms 成功路径；Nack（`DeliveryError`）重试 + 重试耗尽抛；Confirm 超时（`asyncio.TimeoutError`）重试 + 重试耗尽抛；网络断开等通用异常重试；`publish_batch` 全成功/部分失败/全失败/空批量；`BatchPublishResult` 字段（`success`/`failed`/`has_failure`/`total`/`failure_rate`）与 frozen 不可变；Exchange 缓存。**Consumer**（`test_consumer_idempotency.py` + `test_consumer_retry.py` + `test_consumer_registry.py`）：手动 ACK/NACK/重试、死信路由、`DuplicateMessageError` 静默 ACK（不重试）、`@register` 装饰器、ConsumerManager 启停。**业务唯一键**（`test_task_business_unique.py`，13 用例）：Task `(user_id, business_id)` 联合 unique 索引静态校验 + `_ID_KEYS` 优先级 + `insert_idempotent` 业务流（首次/重复/不同用户/非 IntegrityError）+ MQ 重投端到端。`@pytest.mark.integration` 标记需 docker-compose 起 RabbitMQ 的集成测试。**Q9 已完成（累计 ≥ 65 个 MQ 相关单元测试）**。 |
 
 **依赖关系**：1.1.1 → 1.1.2 → 1.1.3/1.1.4/1.1.5（并行）→ 1.1.6/1.1.7/1.1.8（顺序）→ 1.1.9/1.1.10/1.1.11（并行）→ 1.1.12 → 1.1.13 → 1.1.14 → 1.1.15
 
@@ -67,8 +107,9 @@
 | 1.2.3 | Resume ORM Model | `infra/database/models/resume.py` | 含 structured_data JSON 字段 |
 | 1.2.4 | Application ORM Model | `infra/database/models/application.py` | 含状态枚举 + 状态更新时间 |
 | 1.2.5 | AgentMemory ORM Model | `infra/database/models/agent_memory.py` | 含 embedding 向量字段（pgvector） |
-| 1.2.6 | Session / Task ORM Model | `infra/database/models/session.py`, `task.py` | 会话与任务表 |
-| 1.2.7 | 首次迁移脚本 | `alembic/versions/` | `alembic upgrade head` 成功建表 |
+| 1.2.6 | Session / Task ORM Model | `infra/database/models/session.py`, `task.py` | 会话与任务表。**Task 表特殊**（Q9 关键）：1) `id` UUID PK（系统自动生成，**不参与业务幂等**）；2) `user_id` 冗余 FK（`users.id` ON DELETE CASCADE，**从 `sessions.user_id` 同步**）；3) `session_id` FK（`sessions.id` ON DELETE CASCADE）；4) `business_id` String(100) NOT NULL（业务方按 `f"{task_type}:{business_key}"` 规则传入的稳定 ID，**MQ 重投幂等键**）；5) `status` 任务状态枚举；6) `payload` JSONB（输入参数）；7) `result` JSONB（输出结果）；8) `error_message` TEXT（失败原因）；9) `retry_count` INT（重试次数，配合 consumer 重试）。**索引**：`ix_tasks_session_id` / `ix_tasks_status` / `ix_tasks_created_at` / `ix_tasks_updated_at` / `ix_tasks_user_id` + **`uq_tasks_user_business (user_id, business_id) UNIQUE`**（Q9 核心约束，详见 Step 1.16）。 |
+| 1.2.7 | 首次迁移脚本 + Task 业务唯一键迁移 | `backend/migrations/versions/c528168c702d_*.py` + `backend/migrations/versions/a1b2c3d4e5f6_*.py` | `c528168c702d`（init）：建所有表 + 索引 + 枚举。`a1b2c3d4e5f6`（**Q9**）：加 `tasks.user_id`（FK users.id CASCADE，**NOT NULL 假设开发期无脏数据**）+ `tasks.business_id`（String 100 NOT NULL）+ `ix_tasks_user_id` + `uq_tasks_user_business` 联合 unique 索引。`alembic upgrade head` 全部成功。 |
+| 1.2.8 | Alembic 配置 | `backend/migrations/env.py` + `backend/alembic.ini` | env.py 配置 `target_metadata = Base.metadata`，从 `app.infra.database.models` 导入所有 ORM 自动检测 schema diff |
 
 **依赖关系**：1.1.9 → 1.2.1~1.2.6（并行）→ 1.2.7
 
@@ -280,6 +321,31 @@
 
 ---
 
+### Step 1.16 - 业务 MQ 接入（Q9 关键收口）
+
+> **本 Step 解决的核心问题**：Step 1.1 已搭好 MQ 基础设施（publisher/consumer/registry/topology/幂等键 + 静默 ACK），但**业务层（Service / Router）零接入**。`domain/*/service.py` 全部为空壳，`@register` 装饰器未被任何业务函数使用。本 Step 定义业务接入的标准模式与契约。
+>
+> **接入模板与 1.6.7/1.6.13/1.6.14/1.7.12/1.8.11 的关系**：本 Step 抽出通用接入模板；具体业务场景（Job Analysis / Resume Match / Communication）由后续 Step 按模板实现。
+
+**目标**：业务 Service 落 Task + Publisher 发消息 + Consumer 执行 + 落结果 + 发完成事件 的标准流水线可复用
+
+| 序号 | 任务 | 涉及文件 | 验收标准 |
+|------|------|---------|---------|
+| 1.16.1 | **业务接入契约文档** | `docs/architecture/mq_integration_contract.md` | 明确"业务方传 `business_id`"的具体规则：`f"{task_type}:{business_key}"` 命名、稳定性要求（同一操作重试 ID 一致）、`user_id` 同步来源（必须从 session 同步，禁止信任客户端）、失败重投后业务方是否能重试成功的判定标准。包含反例（错误用 `id` UUID、错误用 `f"{user_id}:{timestamp}"`）。 |
+| 1.16.2 | **Task Service 骨架** | `domain/task/service.py` + `domain/task/dto.py` + `infra/repositories/task_repo.py` | 任务生命周期：`create_task(type, business_id, payload, session)`（内部用 `insert_idempotent`）、`get_task(task_id)`、`mark_running(task_id)`、`mark_completed(task_id, result)`、`mark_failed(task_id, error)`、`list_tasks(user_id, status, page)`。**这是后续所有 Agent 业务复用的公共组件**。 |
+| 1.16.3 | **Task Service 单元测试** | `tests/test_task_service.py` | create_task：首次成功 / 同 business_id 重复抛 `DuplicateMessageError` / 不同 user 同 business_id 允许 / 字段缺失抛 `ValueError`；mark_* 状态机：合法转换 + 非法转换抛 `TaskStateError`；get/list 分页正确。 |
+| 1.16.4 | **业务接入模板：Service 层** | `domain/_template_async_service.py`（注释参考） | Service 异步化标准模式：参数校验 → `TaskService.create_task(type, business_id, payload, session)` → `await publisher.publish(exchange, routing_key, body, message_id=business_id)` → 返回 `{task_id}`。降级：MQ 不可用 try/except 后降级同步执行并 `logger.warning`（参考 Step 1.6.7）。 |
+| 1.16.5 | **业务接入模板：Consumer 层** | `infra/message_queue/_template_handler.py`（注释参考） + `tests/test_consumer_handler_template.py` | Consumer 标准模式（5 步流水线）：1) `mark_running`；2) 调用纯计算函数（Agent / LLM 工具）；3) 落结果到业务表（`Job.analysis_result` 等）；4) `mark_completed` + 写缓存（若有）；5) Publisher 发 `agent.event.completed(task_id, result)`。**注册**：`@register("copilot.agent.{type}", max_retries=3, retry_base_delay_ms=10000)`。失败重试 3 次后入死信。 |
+| 1.16.6 | **业务接入模板：Router 层** | `api/_template_async_router.py`（注释参考） | 异步化 Router 标准模式：`POST /xxx` 返回 `202 Accepted` + `{task_id}`（不是 200 + result），新增 `GET /tasks/{task_id}` 轮询状态。**为什么 202 而非 200**：Agent 任务耗时 5s+ 必异步，202 告知客户端"已接受，请轮询"。 |
+| 1.16.7 | **`insert_idempotent` 业务使用示例集** | `domain/common/idempotent.py`（示例注释） + `tests/test_idempotent_usage_examples.py` | 3 个典型场景的端到端测试：1) Task 创建（同 business_id 重投静默 ACK）；2) Resume 上传（同 file_hash 已存在去重）；3) Job 抓取（同 source_url 不重复入库）。每个场景包含"首次成功 + 重复抛 DuplicateMessageError + 消费者基类静默 ACK"三断言。 |
+| 1.16.8 | **业务接入冒烟测试** | `tests/test_business_mq_smoke.py` | `@pytest.mark.integration`：起 test RabbitMQ + 真实业务 Consumer → POST 接口 → 等待 Consumer 处理 → 断言 Task 状态 `completed` + 业务表有结果 + `agent.event.completed` 事件被发出。**这是"基础设施 ↔ 业务层"联通的最低标准**。 |
+
+**依赖关系**：1.1（MQ 基础设施）+ 1.2.6/1.2.7（Task 表业务 unique 约束）+ 1.1.10（`DuplicateMessageError`）+ 1.1.8（消费者基类静默 ACK）→ **1.16.1（契约文档）** → 1.16.2/1.16.3（Task Service） → 1.16.4/1.16.5/1.16.6（接入模板） → 1.16.7（使用示例） → 1.16.8（冒烟测试） → 后续业务 Step 1.6.7/1.6.13/1.6.14/1.7.12/1.8.11
+
+> **关键契约**（必须在 1.16.1 文档中明确）：**业务方必须传 `business_id`** —— 这是 MQ 幂等消费的前置条件。调用方（API/Service）违反契约（不传 / 传 `id` UUID / 传时间戳）的后果是：MQ 重投时业务被重复执行。**Lint / 类型检查 / 集成测试** 三层防御缺一不可。
+
+---
+
 ## Phase 2 - 增强功能
 
 > 前置条件：Phase 1 全部完成并通过验收
@@ -483,10 +549,12 @@ Phase 3（优化）:
 | RabbitMQ 不可用 | Agent 任务无法分发 | 连接重试（RobustConnection）+ 死信队列 + **降级为同步执行并打 warning**（Service 层 try/except） |
 | 缓存击穿 | 高并发下大量请求穿透到 DB | 写后失效 + 30min TTL 兜底 + Redis fail-open 降级 |
 | 缓存与 DB 不一致 | 短暂返回陈旧数据 | TTL 兜底（30min 内自愈）+ 监控命中率 |
-| **MQ 重复消费** | Agent 被执行多次，结果重复落库 | Consumer 内幂等：Task 进入 running 时检查 status（pending 才推进，否则 ACK 丢弃）；Agent 落库用 `INSERT ... ON CONFLICT DO UPDATE` |
+| **MQ 重复消费** | Agent 被执行多次，结果重复落库 | **业务方传 `business_id` + 业务表 `(user_id, business_id)` 联合 unique 约束**：`IntegrityError` → `DuplicateMessageError` → 消费者基类静默 ACK（不重试、不进死信）。见 Step 1.16 业务接入契约。 |
+| **业务方违反 `business_id` 契约** | MQ 重投时业务被重复执行（业务方传 `id` UUID / 时间戳 / 不传） | **三层防御**：1) 契约文档（Step 1.16.1）+ Reviewer 培训；2) 静态检查：`Task` Service 构造时 `business_id` 必填非空；3) 集成测试（Step 1.16.8 冒烟测试）：同 `business_id` 重发两条消息，断言只产生 1 条 DB 记录。 |
 | **WebSocket 断连导致通知丢失** | 前端错过 task_completed 事件，体验降级 | Notification Consumer 推送失败入 fallback 队列 + Extension 端 `GET /api/tasks/{id}?since=<last_id>` 增量拉取兜底 |
 | **Task 长期 pending（消费者卡死）** | 用户一直看不到结果 | Task 增加 `heartbeat_at` 字段，Consumer 每 30s 刷新；超 5min 无心跳自动 mark_failed 并发告警 |
 | **同进程 Consumer 与 Web 抢资源** | Web 请求延迟升高 | Consumer 限制并发（asyncio.Semaphore=10）+ LLM 调用集中走 httpx 连接池监控 |
+| **business_id 不稳定（业务方传时间戳/UUID）** | 同一操作重试时 ID 不同，unique 约束失效，重复消费 | Step 1.16.1 契约文档明确禁止；Step 1.16.7 集成测试用同 `business_id` 重发，断言 1 条 DB 记录 |
 
 ---
 
@@ -580,8 +648,12 @@ infra/message_queue/
 | prefetch_count | 10 | 防止消费者一次性拉取过多消息导致内存溢出 |
 | 消息确认 | 手动 ACK | 确保消息处理成功后再确认，失败可重入队列 |
 | **Publisher 可靠性** | **全量 Publisher Confirms（Q9）** | aio-pika `RobustChannel` 默认 `publisher_confirms=True`；`await exchange.publish()` 已等待 Broker `Basic.Ack`，Nack 抛 `DeliveryError`、Confirm 超时走 `asyncio.wait_for(timeout=10s)`。**不使用 AMQP 事务**：吞吐差 10×，且批量中间失败无法回滚 |
-| **Consumer 端幂等** | **message_id 复用业务 ID（Q9）** | 业务侧传 `task_id` / `notification_id` 等唯一 ID，Publisher 写入 AMQP `message_id` + `headers["x-business-id"]`；消费者通过该 ID 去重（与 `MQ 重复消费` 风险防御配合） |
+| **Consumer 端幂等** | **业务表 unique 约束 + DuplicateMessageError 静默 ACK（Q9）** | 业务方传 `business_id`（推荐 f"{task_type}:{business_key}"）；Task 表加 `(user_id, business_id)` 联合 unique 索引（migration `a1b2c3d4e5f6`）；重复 INSERT 触发 `IntegrityError` → `insert_idempotent` 转换为 `DuplicateMessageError` → 消费者基类静默 ACK（不重试，不进死信）。**message_id 复用业务 ID**：Publisher 写入 AMQP `message_id` + `headers["x-business-id"]`，便于日志追踪。 |
 | **批量发布** | **`BatchPublishResult` 结构化返回（Q9）** | `publish_batch` 不抛异常，返回 `(success: list[str], failed: list[tuple[str, Exception]])`，调用方按 `has_failure` / `failure_rate` 决策补偿 |
+| **business_id 提取顺序** | **`business_id > task_id > notification_id > id > message_id`** | `business_id` 是业务方按规则传入的稳定 ID（`f"{task_type}:{business_key}"`），专用幂等键；`id` 在 Task 表是 UUID PK 每次新生成不参与业务去重。提取顺序在 `publisher._BATCH_ID_KEYS` 和 `idempotent._ID_KEYS` **严格一致**。 |
+| **`DuplicateMessageError` 异常层级** | **继承 `Exception` 而非 `AppException`** | `AppException` 专用于 API 错误响应（4xx/5xx）；`DuplicateMessageError` 是 MQ 消费者内部控制流信号，不应混入 HTTP 错误体系。消费者基类单独识别此异常 → 静默 ACK（不重试）。 |
+| **Task 表 `user_id` 冗余** | **不 join sessions，user_id 直接冗余在 tasks 表** | `(user_id, business_id)` 联合 unique 索引必须 user_id 直接在 tasks 表上，PG 索引不支持跨表 join。Service 层在创建 Task 时从 session_id 同步 user_id（数据一致性由应用层保证）。 |
+| **Task 表幂等键 vs 业务层 idempotent** | **Task 表 unique 约束 + `insert_idempotent` helper 共同保证** | DB unique 是原子硬约束（最终防线），`insert_idempotent` 是类型化包装（语义清晰、把 `IntegrityError` 转 `DuplicateMessageError`）。两者缺一不可：少了 DB 约束则有 TOCTOU 竞态；少了 helper 则调用方要重复写 try/except。 |
 
 ### 依赖
 
