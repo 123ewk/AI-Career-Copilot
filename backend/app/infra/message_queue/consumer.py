@@ -50,6 +50,7 @@ from aio_pika.abc import (
     AbstractRobustChannel,
 )
 
+from app.core.exceptions import DuplicateMessageError
 from app.core.logger import logger
 from app.infra.message_queue.exchanges import EXCHANGE_RETRY
 
@@ -196,7 +197,8 @@ class MessageConsumer(ABC):
         2. 解码 JSON body
         3. 调用子类 handle_message()
         4. 成功 → ACK
-        5. 失败 → 计算新 retry_count：
+        5. 重复消息（DuplicateMessageError） → 静默 ACK（业务表 unique 约束拒绝）
+        6. 失败 → 计算新 retry_count：
            - 未超限：publish 到 retry exchange（带 expiration）
                     → 成功后 ack 原消息
            - 超限：NACK(requeue=False) 进入死信
@@ -223,6 +225,20 @@ class MessageConsumer(ABC):
                     "消息处理成功",
                     extra={
                         "queue": self._queue_name,
+                        "retry_count": retry_count,
+                    },
+                )
+
+            except DuplicateMessageError as e:
+                # 重复消息：业务表 unique 约束拒绝（配合 domain.common.idempotent
+                # 的 insert_idempotent 抛出）。这是 at-least-once 重投的正常分支，
+                # 静默 ACK 不重试 —— 重试也是重复。
+                await message.ack()
+                logger.info(
+                    "重复消息丢弃（业务表 unique 约束拒绝）",
+                    extra={
+                        "queue": self._queue_name,
+                        "message_id": e.message_id,
                         "retry_count": retry_count,
                     },
                 )
