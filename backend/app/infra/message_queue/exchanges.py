@@ -84,6 +84,7 @@ EXCHANGE_WORKFLOW = "copilot.workflow.exchange"
 EXCHANGE_NOTIFICATION = "copilot.notification.exchange"
 EXCHANGE_RESUME = "copilot.resume.exchange"
 EXCHANGE_MATCH = "copilot.match.exchange"
+EXCHANGE_AGENT = "copilot.agent.exchange"
 EXCHANGE_DLX = "copilot.dlx.exchange"
 EXCHANGE_RETRY = "copilot.retry.exchange"
 
@@ -104,6 +105,9 @@ QUEUE_RESUME_PARSE = "copilot.resume.parse"
 
 QUEUE_MATCH_COMPUTE = "copilot.match.compute"
 
+# Agent 任务队列
+QUEUE_AGENT_JOB_ANALYSIS = "copilot.agent.job_analysis"
+
 QUEUE_DLX_DEAD_LETTER = "copilot.dlx.dead_letter"
 
 # Routing Key
@@ -122,6 +126,9 @@ ROUTING_NOTIFICATION_WEBHOOK = "webhook"
 ROUTING_RESUME_PARSE = "resume.parse"
 
 ROUTING_MATCH_COMPUTE = "match.compute"
+
+# Agent Routing Key
+ROUTING_AGENT_JOB_ANALYSIS = "agent.job_analysis"
 
 # ==================== 重试队列映射 ====================
 # 每个主队列对应一个重试队列，DLX 回主 exchange
@@ -312,6 +319,17 @@ async def declare_all(channel: AbstractRobustChannel) -> None:
         main_exchange_type=ExchangeType.DIRECT,
         queue_name=QUEUE_MATCH_COMPUTE,
         routing_key=ROUTING_MATCH_COMPUTE,
+        queue_message_ttl_ms=2 * 3600 * 1000,
+    )
+
+    # ---------- Agent 任务 Exchange（Topic：支持 agent.* 通配订阅）----------
+    await _declare_main_queue_with_retry(
+        channel,
+        main_exchange_name=EXCHANGE_AGENT,
+        main_exchange_type=ExchangeType.TOPIC,
+        queue_name=QUEUE_AGENT_JOB_ANALYSIS,
+        routing_key=ROUTING_AGENT_JOB_ANALYSIS,
+        # Agent 任务 TTL 2 小时（LLM 调用可能耗时较长）
         queue_message_ttl_ms=2 * 3600 * 1000,
     )
 

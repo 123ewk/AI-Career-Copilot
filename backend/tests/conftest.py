@@ -63,6 +63,17 @@ warnings.filterwarnings(
     category=DeprecationWarning,
     module=r"starlette(\..*)?",
 )
+# 抑制 pyjwt 密钥长度警告：测试用密钥故意短（27 bytes < 32 bytes minimum）
+# pyjwt >= 2.10 触发 InsecureKeyLengthWarning，pyproject.toml filterwarnings=["error"] 提升为 error
+try:
+    from jwt.warnings import InsecureKeyLengthWarning  # type: ignore[import-untyped]
+
+    warnings.filterwarnings(
+        "ignore",
+        category=InsecureKeyLengthWarning,
+    )
+except ImportError:
+    pass
 
 
 # ==================== 环境变量 ====================
@@ -85,6 +96,8 @@ def _setup_test_env() -> None:
     # LLM：测试不需要真实调用，留空即可
     os.environ.setdefault("OPENAI_API_KEY", "")
     os.environ.setdefault("DEEPSEEK_API_KEY", "")
+    os.environ.setdefault("MIMO_API_KEY", "")
+    os.environ.setdefault("TAVILY_API_KEY", "")
 
 
 # ==================== Settings 工厂 ====================

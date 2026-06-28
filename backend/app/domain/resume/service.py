@@ -90,9 +90,7 @@ from app.domain.resume.validator import (
     validate_parsed_text_length,
     validate_resume_upload,
 )
-from app.infra.cache.resume import RedisResumeCache
 from app.infra.database.models.resume import Resume
-from app.infra.repositories.resume_repo import ResumeRepository
 from app.tools.file.docx_reader import DOCXReader
 from app.tools.file.pdf_reader import PDFReader
 
@@ -123,7 +121,9 @@ class ResumeService:
 
     设计原则：
     - 单实例对应一个请求：构造时注入 session,所有操作共用同一事务
-    - 内部创建 Repository + Reader + Cache:避免外部重复实例化
+    - Repository / Cache 通过构造函数注入:None 时使用默认 Infra 实现,
+      测试可替换为 FakeRepository / FakeResumeCache
+    - Reader 无状态,内部实例化即可
     - 显式 commit:业务成功后由 Service 显式 commit,便于业务层回滚控制
     - 异常翻译:DB 异常(IntegrityError)→ 业务异常(ResourceNotFoundError 等)
     - 跨用户隔离:所有读/写接口都接收 user_id,Repository 层做 ownership 过滤
@@ -135,23 +135,32 @@ class ResumeService:
     def __init__(
         self,
         session: AsyncSession,
+        repo: ResumeRepositoryProtocol | None = None,
         cache: ResumeCacheProtocol | None = None,
     ) -> None:
         """初始化 Service
 
         Args:
             session: 异步数据库 session（单次请求共用一个事务）
+            repo: 简历仓储实现。None 时默认用 ResumeRepository
             cache: 简历缓存实现。None 时默认用 RedisResumeCache
                    · 生产环境:走全局 Redis 单例
                    · 测试环境:可传 FakeResumeCache（内存 dict）实现 Protocol
         """
         self._session = session
+        if repo is None:
+            # 延迟导入具体实现,避免 Domain 模块顶层依赖 Infra
+            from app.infra.repositories.resume_repo import ResumeRepository
+            repo = ResumeRepository(session)
         # 类型标注为 Protocol,便于测试时替换为 FakeRepository
-        self._repo: ResumeRepositoryProtocol = ResumeRepository(session)
+        self._repo: ResumeRepositoryProtocol = repo
+
+        if cache is None:
+            # 延迟导入具体实现,避免 Domain 模块顶层依赖 Infra
+            from app.infra.cache.resume import RedisResumeCache
+            cache = RedisResumeCache()
         # 缓存:默认走 Redis,测试时可注入 FakeResumeCache
-        self._cache: ResumeCacheProtocol = (
-            cache if cache is not None else RedisResumeCache()
-        )
+        self._cache: ResumeCacheProtocol = cache
         # Reader 无状态,模块级单例/实例化皆可,实例化更显式
         self._pdf_reader = PDFReader()
         self._docx_reader = DOCXReader()

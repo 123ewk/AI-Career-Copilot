@@ -98,6 +98,7 @@ backend/tests/debug_*.py
 
 # ===== AI 工具配置（不同 IDE/工具生成的本地指引，团队共享工程无需） =====
 CLAUDE.md
+.claude/
 .cursor/
 .copilot/
 

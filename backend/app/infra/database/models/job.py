@@ -151,6 +151,16 @@ class Job(Base):
         comment="难度评级（easy/medium/hard）",
     )
 
+    # 完整分析结果：Job Analysis Agent 的 LLM 提取输出（JSONB）
+    # 包含 skills/keywords/seniority/difficulty/salary_range/company_info/hidden_requirements
+    # 顶层 skills/keywords/seniority/difficulty 为冗余字段（便于索引查询），
+    # analysis_result 存储完整结构化数据（含 salary_range/company_info/hidden_requirements）
+    analysis_result: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Job Analysis Agent 完整分析结果（JSONB）",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         nullable=False,
         server_default=text("now()"),

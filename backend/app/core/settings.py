@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     jwt_refresh_token_expire_days: int = 7
 
     # ==================== LLM ====================
-    # 当前使用的 LLM 提供商：deepseek / openai
+    # 当前使用的 LLM 提供商：deepseek / openai / mimo
     llm_provider: str = "deepseek"
     openai_api_key: str = ""
     openai_api_base: str = "https://api.openai.com/v1"
@@ -95,10 +95,15 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     deepseek_api_base: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
+    mimo_api_key: str = ""
+    mimo_api_base: str = "https://token-plan-cn.xiaomimimo.com/v1"
+    mimo_model: str = "mimo-v2.5"
 
     @property
     def llm_api_key(self) -> str:
         """根据 llm_provider 返回对应的 API Key"""
+        if self.llm_provider == "mimo":
+            return self.mimo_api_key
         if self.llm_provider == "deepseek":
             return self.deepseek_api_key
         return self.openai_api_key
@@ -106,6 +111,8 @@ class Settings(BaseSettings):
     @property
     def llm_api_base(self) -> str:
         """根据 llm_provider 返回对应的 API Base URL"""
+        if self.llm_provider == "mimo":
+            return self.mimo_api_base
         if self.llm_provider == "deepseek":
             return self.deepseek_api_base
         return self.openai_api_base
@@ -113,9 +120,19 @@ class Settings(BaseSettings):
     @property
     def llm_model(self) -> str:
         """根据 llm_provider 返回对应的模型名称"""
+        if self.llm_provider == "mimo":
+            return self.mimo_model
         if self.llm_provider == "deepseek":
             return self.deepseek_model
         return self.openai_model
+
+    # ==================== Tavily Search ====================
+    tavily_api_key: str = ""
+    tavily_api_base: str = "https://api.tavily.com"
+    tavily_search_depth: str = "basic"  # "basic" or "advanced"
+    tavily_max_results: int = 5
+    tavily_timeout: float = 15.0
+    tavily_max_retries: int = 3
 
     # ==================== 缓存 ====================
     # active resume 缓存 TTL(秒)
@@ -124,6 +141,8 @@ class Settings(BaseSettings):
     # 设大(如 3600)→ DB 压力更小但陈旧数据窗口更长
     # 设为 0 → 禁用缓存(用于压测或紧急回滚)
     resume_cache_ttl_seconds: int = 1800
+    # Job Analysis 缓存 TTL：LLM 分析结果相对稳定，可设更长
+    job_analysis_cache_ttl_seconds: int = 3600
 
     # ==================== 文件上传 ====================
     upload_dir: str = "./uploads"

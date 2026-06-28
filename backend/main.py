@@ -41,6 +41,7 @@ from app.infra.database.postgres import pg_session_factory
 from app.infra.database.redis import redis_client_factory
 from app.infra.message_queue.connection import rabbitmq_connection_factory
 from app.infra.message_queue.exchanges import declare_all
+from app.infra.message_queue.handlers import job_analysis  # noqa: F401  触发 @register
 from app.infra.message_queue.registry import consumer_manager
 
 # ==================== Lifespan ====================

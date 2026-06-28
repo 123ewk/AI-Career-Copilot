@@ -12,7 +12,6 @@
 
 各文件对应：
 - resume.py  → ResumeCacheProtocol（Step 1.5.10,已完成）
-- job.py     → JobAnalysisCacheProtocol（Step 1.6.12,待实现）
 - match.py   → MatchCacheProtocol（Step 1.7.12,待实现）
 - communication.py → TemplateCacheProtocol（Step 1.8.11,待实现）
 - session.py → SessionCacheProtocol（Step 1.10.7,待实现）
@@ -32,7 +31,6 @@
 def __getattr__(name: str):  # type: ignore[no-redef]
     """延迟解析:模块内 import 失败时不抛错,允许属性级重试"""
     _imports = {
-        "JobAnalysisCacheProtocol": ("app.domain.cache.job", "JobAnalysisCacheProtocol"),
         "MatchCacheProtocol": ("app.domain.cache.match", "MatchCacheProtocol"),
         "TemplateCacheProtocol": ("app.domain.cache.communication", "TemplateCacheProtocol"),
         "SessionCacheProtocol": ("app.domain.cache.session", "SessionCacheProtocol"),
@@ -57,7 +55,6 @@ def __getattr__(name: str):  # type: ignore[no-redef]
 from app.domain.cache.resume import ResumeCacheProtocol
 
 __all__ = [
-    "JobAnalysisCacheProtocol",
     "MatchCacheProtocol",
     "ResumeCacheProtocol",
     "SessionCacheProtocol",

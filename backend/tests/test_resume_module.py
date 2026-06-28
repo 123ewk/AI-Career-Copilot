@@ -294,9 +294,11 @@ def service(
     mock_session: AsyncSession,
 ) -> ResumeService:
     """构造一个使用 fake repo + fake cache 的 ResumeService"""
-    svc = ResumeService(session=mock_session, cache=fake_cache)  # type: ignore[arg-type]
-    # 替换默认 Repository 为 fake（避免真实 SQLAlchemy 操作）
-    svc._repo = fake_repo  # type: ignore[assignment]
+    svc = ResumeService(
+        session=mock_session,
+        repo=fake_repo,
+        cache=fake_cache,
+    )
     return svc
 
 

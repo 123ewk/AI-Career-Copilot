@@ -38,6 +38,7 @@ dependencies = [
     "pypdf>=6.13.2",
     "python-docx>=1.2.0",
     "python-multipart>=0.0.32",
+    "tavily-python>=0.7.26",
 ]
 
 # ==================== Dev 依赖 ====================
@@ -159,6 +160,8 @@ filterwarnings = [
     "ignore::DeprecationWarning:fastapi.*",
     "ignore::DeprecationWarning:starlette.*",
     "ignore::PendingDeprecationWarning",
+    "ignore::UserWarning:jwt.*",
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
 ]
 markers = [
     "integration: 集成测试，需要真实 PostgreSQL/Redis/RabbitMQ",

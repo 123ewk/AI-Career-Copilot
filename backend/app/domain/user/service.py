@@ -55,6 +55,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.domain.repositories.user import UserRepositoryProtocol
 from app.domain.user.models import (
     TokenResponse,
     UserLoginRequest,
@@ -62,7 +63,6 @@ from app.domain.user.models import (
     UserResponse,
 )
 from app.infra.database.models.user import User
-from app.infra.repositories.user_repo import UserRepository
 
 
 # 登录失败统一提示：避免泄露「用户不存在」还是「密码错误」
@@ -86,9 +86,18 @@ class UserService:
     - 异常翻译：DB 异常（IntegrityError）→ 业务异常（ConflictError）
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        repo: UserRepositoryProtocol | None = None,
+    ) -> None:
         self._session = session
-        self._repo = UserRepository(session)
+        if repo is None:
+            # 延迟导入具体实现，避免 Domain 模块顶层依赖 Infra
+            from app.infra.repositories.user_repo import UserRepository
+
+            repo = UserRepository(session)
+        self._repo: UserRepositoryProtocol = repo
 
     # ==================== 公共业务方法 ====================
 

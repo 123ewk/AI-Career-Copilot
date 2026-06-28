@@ -132,10 +132,8 @@ class TestUserServiceRegister:
     @pytest.fixture
     def service(self) -> UserService:
         session = make_mock_session()
-        svc = UserService(session)
-        # 替换内置 repo 为 mock
-        svc._repo = AsyncMock(spec=UserRepository)
-        return svc
+        mock_repo = AsyncMock(spec=UserRepository)
+        return UserService(session, repo=mock_repo)
 
     @pytest.mark.asyncio
     async def test_returns_user_response_and_tokens(self, service, strong_hash: str) -> None:
@@ -561,8 +559,9 @@ def make_app(monkeypatch: pytest.MonkeyPatch):
     """
     def _factory(mock_session: AsyncMock, mock_repo: AsyncMock) -> FastAPI:
         # 把 UserRepository 类替换为返回我们 mock 的 lambda
+        # UserService 内部延迟从 infra 模块导入默认 Repository，因此 patch 目标为 infra 模块
         monkeypatch.setattr(
-            "app.domain.user.service.UserRepository",
+            "app.infra.repositories.user_repo.UserRepository",
             lambda session: mock_repo,
         )
         return _build_test_app(mock_session, mock_repo, monkeypatch)
