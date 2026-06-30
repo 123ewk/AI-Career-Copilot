@@ -23,14 +23,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 from app.core.logger import logger
 from app.domain.job.extractor import JobExtractor
 from app.domain.job.models import JobAnalysisResult, JDParseResult
 from app.domain.job.parser import JDParser
 from app.runtime.state.agent_state import AgentState, validate_transition
+from app.tools.retrieval.models import CompanySearchResults
 from app.tools.retrieval.web_search import WebSearchTool
 
 
@@ -47,7 +47,7 @@ class AgentRunResult:
 
     analysis: JobAnalysisResult | None = None
     agent_state: AgentState = AgentState.COMPLETED
-    company_info: Any | None = None
+    company_info: CompanySearchResults | None = None
     error: str | None = None
 
 
