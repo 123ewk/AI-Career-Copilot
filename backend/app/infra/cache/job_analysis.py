@@ -124,6 +124,7 @@ class RedisJobAnalysisCache:
         self,
         job_id: uuid.UUID,
         analysis: JobAnalysisResult,
+        ttl_seconds: int | None = None,
     ) -> None:
         """写入岗位分析结果缓存
 
@@ -134,11 +135,13 @@ class RedisJobAnalysisCache:
         Args:
             job_id: 岗位 UUID
             analysis: 待缓存的分析结果
+            ttl_seconds: 缓存 TTL(秒)。None 时使用构造时传入或 settings 中的默认值
         """
+        ttl = ttl_seconds if ttl_seconds is not None else self._ttl_seconds
         try:
             await self._redis.setex(
                 _make_key(job_id),
-                self._ttl_seconds,
+                ttl,
                 analysis.model_dump_json(),
             )
         except Exception as exc:
