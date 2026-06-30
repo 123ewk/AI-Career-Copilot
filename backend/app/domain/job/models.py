@@ -495,13 +495,15 @@ class JobCreateRequest(BaseModel):
 
 
 class JobAnalyzeRequest(BaseModel):
-    """触发 JD 分析请求（POST /api/jobs/{id}/analyze）
+    """触发 JD 分析请求（POST /api/jobs/analyze）
 
     字段：
     - job_id: 已入库的岗位 ID
+    - session_id: 当前会话 ID（任务归属）
 
     设计：
     - 仅接受 job_id：避免「不入库直接分析」的孤儿任务
+    - session_id 用于创建异步 Task，关联 tasks.session_id 外键
     - 业务唯一性由 Step 1.16 业务幂等键保证（service 层用 (user_id, business_id) 联合 unique）
     - 强类型 UUID：避免字符串误传
     """
@@ -513,6 +515,10 @@ class JobAnalyzeRequest(BaseModel):
     job_id: uuid.UUID = Field(
         ...,
         description="已入库的岗位 ID",
+    )
+    session_id: uuid.UUID = Field(
+        ...,
+        description="当前会话 ID（用于创建异步任务）",
     )
 
 
@@ -727,14 +733,17 @@ class JobAnalyzeResponse(BaseModel):
 
     字段：
     - job_id: 岗位 ID
-    - task_id: 异步任务 ID（前端轮询用）
-    - status: 任务初始状态（固定 'pending'）
+    - task_id: 异步任务 ID（前端轮询用）。completed 时为 None
+    - status: 任务状态（pending / completed）
+    - analysis_result: 已完成的分析结果（仅在 completed 时有值）
+    - cached: 是否来自缓存命中
 
     设计动机（Step 1.6.10 契约）：
     - 异步返回 202 + {task_id}，不是 200 + result
     · Agent 任务耗时 5s+ 必异步（项目规则：LLM 必异步）
     · 202 告知客户端"已接受，请轮询 GET /api/tasks/{task_id}"
-    - status 字段为前端立即反馈「任务已接收」，无需等待 Consumer 处理
+    - 同步降级 / 缓存命中时直接返回 completed + analysis_result，减少一次轮询
+    - status 字段为前端立即反馈「任务已接收/已完成」
     - 业务唯一性由 Service 层配合 (user_id, business_id) 联合 unique 保证
     """
 
@@ -746,13 +755,21 @@ class JobAnalyzeResponse(BaseModel):
         ...,
         description="岗位 ID",
     )
-    task_id: uuid.UUID = Field(
-        ...,
-        description="异步任务 ID（轮询 GET /api/tasks/{task_id}）",
+    task_id: uuid.UUID | None = Field(
+        default=None,
+        description="异步任务 ID（pending 时非空，completed 时 None）",
     )
-    status: Literal["pending"] = Field(
-        default="pending",
-        description="任务初始状态（固定 pending）",
+    status: Literal["pending", "completed"] = Field(
+        ...,
+        description="任务状态（pending: 已入队待处理 / completed: 已完成）",
+    )
+    analysis_result: JobAnalysisResult | None = Field(
+        default=None,
+        description="已完成的分析结果（status=completed 时返回）",
+    )
+    cached: bool = Field(
+        default=False,
+        description="是否来自缓存命中",
     )
 
 

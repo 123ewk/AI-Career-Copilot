@@ -1,15 +1,20 @@
 """Job Service 单元测试
 
 职责：
-- 测试 JobService 的业务逻辑
-- 使用 unittest.mock 模拟 Repository、Parser、Extractor、WebSearchTool
-- 覆盖正常流程、边界条件、异常流程
+- 测试 JobService 的业务编排逻辑
+- Mock Repository / TaskService / Publisher / Cache / AgentService
+- 覆盖创建/查询/列表/分析（异步化版本）正常 + 异常流程
 
 测试策略：
-- Mock 依赖：JobRepository、JDParser、JobExtractor、WebSearchTool
-- 正常流程：创建岗位、查询岗位、分析岗位
-- 边界条件：source_url 去重、空 JD、已有分析结果
-- 异常流程：LLM 提取失败、Web 搜索失败
+- Mock 依赖：JobRepository、TaskService、MessagePublisher、JobAnalysisCacheProtocol、AgentService
+- 正常流程：创建岗位、查询岗位、列表、异步分析（pending/completed）
+- 边界条件：source_url 去重、已有分析结果、缓存命中
+- 异常流程：岗位不存在、LLM 失败、MQ 失败降级
+
+与异步 API 的对齐（Step 1.6.7 契约）：
+- analyze_job 不再同步执行 Agent，而是创建 Task + 发 MQ → 返回 JobAnalyzeResponse
+- analyze_job 必传 user_id 和 session_id 关键字参数
+- MQ 失败时降级为同步执行（sync_fallback=True）或抛 MessageQueueError（sync_fallback=False）
 """
 
 from __future__ import annotations
@@ -21,19 +26,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ExternalServiceError, ResourceNotFoundError
-from app.domain.job.extractor import JobExtractor
+from app.core.exceptions import (
+    ExternalServiceError,
+    MessageQueueError,
+    ResourceNotFoundError,
+)
+from app.domain.agent.job_analysis_agent import AgentRunResult
 from app.domain.job.models import (
     JobAnalysisResult,
     JobAnalyzeResponse,
-    JobCreateRequest,
+    JobListResponse,
     JobResponse,
 )
-from app.domain.job.parser import JDParser
 from app.domain.job.service import JobService
+from app.domain.task.dto import TaskDTO
 from app.infra.database.models.job import Job
-from app.infra.repositories.job_repo import JobRepository
-from app.tools.retrieval.web_search import WebSearchTool
+from app.infra.database.models.task import TaskStatus
+from app.runtime.state.agent_state import AgentState
+
 
 # ==================== Fixtures ====================
 
@@ -50,55 +60,81 @@ def mock_session() -> AsyncMock:
 @pytest.fixture
 def mock_repo() -> AsyncMock:
     """模拟 JobRepository"""
-    repo = AsyncMock(spec=JobRepository)
-    return repo
+    return AsyncMock()
 
 
 @pytest.fixture
-def mock_parser() -> AsyncMock:
-    """模拟 JDParser"""
-    parser = AsyncMock(spec=JDParser)
-    return parser
+def mock_task_service() -> AsyncMock:
+    """模拟 TaskService"""
+    return AsyncMock()
 
 
 @pytest.fixture
-def mock_extractor() -> AsyncMock:
-    """模拟 JobExtractor"""
-    extractor = AsyncMock(spec=JobExtractor)
-    return extractor
+def mock_publisher() -> AsyncMock:
+    """模拟 MessagePublisher"""
+    return AsyncMock()
 
 
 @pytest.fixture
-def mock_web_search() -> AsyncMock:
-    """模拟 WebSearchTool"""
-    tool = AsyncMock(spec=WebSearchTool)
-    return tool
+def mock_cache() -> AsyncMock:
+    """模拟 JobAnalysisCacheProtocol"""
+    cache = AsyncMock()
+    cache.get.return_value = None  # 默认缓存未命中
+    return cache
+
+
+@pytest.fixture
+def mock_agent_service() -> AsyncMock:
+    """模拟 AgentService
+
+    引用模块级 MOCK_ANALYSIS_RESULT（定义在文件下方）：
+    fixture 在测试运行时才被调用，此时模块已完全加载，模块级常量均可解析。
+    """
+    service = AsyncMock()
+    service.analyze_job.return_value = AgentRunResult(
+        analysis=MOCK_ANALYSIS_RESULT,
+        agent_state=AgentState.COMPLETED,
+        company_info=None,
+        error=None,
+    )
+    return service
 
 
 @pytest.fixture
 def service(
     mock_session: AsyncMock,
     mock_repo: AsyncMock,
-    mock_parser: AsyncMock,
-    mock_extractor: AsyncMock,
-    mock_web_search: AsyncMock,
+    mock_task_service: AsyncMock,
+    mock_publisher: AsyncMock,
+    mock_cache: AsyncMock,
+    mock_agent_service: AsyncMock,
 ) -> JobService:
-    """JobService 实例（所有依赖已 mock）"""
-    svc = JobService(session=mock_session, repo=mock_repo)
-    # 注入其余 mock 依赖
-    svc._parser = mock_parser
-    svc._extractor = mock_extractor
-    svc._web_search = mock_web_search
-    return svc
+    """JobService 实例（所有依赖已 mock）
+
+    注意：JobService 异步化后不再持有 _parser/_extractor/_web_search，
+    这些依赖收敛到 AgentService Facade 内部。
+    """
+    return JobService(
+        session=mock_session,
+        repo=mock_repo,
+        task_service=mock_task_service,
+        publisher=mock_publisher,
+        cache=mock_cache,
+        agent_service=mock_agent_service,
+    )
 
 
 # ==================== 测试数据 ====================
 
 SAMPLE_JOB_ID = uuid.uuid4()
+SAMPLE_USER_ID = uuid.uuid4()
+SAMPLE_SESSION_ID = uuid.uuid4()
+SAMPLE_TASK_ID = uuid.uuid4()
 SAMPLE_TITLE = "Python 高级工程师"
 SAMPLE_COMPANY = "字节跳动"
 SAMPLE_JD_TEXT = "负责后端系统开发，要求熟悉 Python、FastAPI、PostgreSQL..."
 SAMPLE_SOURCE = "boss"
+SAMPLE_BUSINESS_ID = f"analyze_jd:{SAMPLE_JOB_ID}"
 
 MOCK_ANALYSIS_RESULT = JobAnalysisResult(
     skills=["Python", "FastAPI", "PostgreSQL"],
@@ -108,7 +144,7 @@ MOCK_ANALYSIS_RESULT = JobAnalysisResult(
 )
 
 
-def _make_job(**overrides) -> MagicMock:
+def _make_job_orm(**overrides) -> MagicMock:
     """构造模拟 Job ORM 实例"""
     defaults = {
         "id": SAMPLE_JOB_ID,
@@ -124,7 +160,7 @@ def _make_job(**overrides) -> MagicMock:
         "keywords": ["AI应用开发"],
         "seniority": "senior",
         "difficulty": "hard",
-        "analysis_result": MOCK_ANALYSIS_RESULT.model_dump(),
+        "analysis_result": None,  # 默认未分析
         "created_at": datetime(2026, 1, 1, 12, 0, 0),
     }
     defaults.update(overrides)
@@ -132,6 +168,23 @@ def _make_job(**overrides) -> MagicMock:
     for key, value in defaults.items():
         setattr(job, key, value)
     return job
+
+
+def _make_task_dto(status: TaskStatus = TaskStatus.PENDING) -> TaskDTO:
+    """构造模拟 TaskDTO"""
+    return TaskDTO(
+        id=SAMPLE_TASK_ID,
+        user_id=SAMPLE_USER_ID,
+        session_id=SAMPLE_SESSION_ID,
+        business_id=SAMPLE_BUSINESS_ID,
+        task_type="analyze_jd",
+        status=status,
+        input_data={"job_id": str(SAMPLE_JOB_ID)},
+        result=None,
+        error_message=None,
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        updated_at=datetime(2026, 1, 1, 12, 0, 1),
+    )
 
 
 # ==================== Create Job ====================
@@ -147,7 +200,7 @@ class TestJobServiceCreate:
     ) -> None:
         """创建基本岗位"""
         mock_repo.get_by_source_url.return_value = None
-        mock_repo.create.return_value = _make_job()
+        mock_repo.create.return_value = _make_job_orm()
 
         result = await service.create_job(
             title=SAMPLE_TITLE,
@@ -166,7 +219,7 @@ class TestJobServiceCreate:
         mock_repo: AsyncMock,
     ) -> None:
         """source_url 已存在时返回已有岗位（去重）"""
-        existing_job = _make_job()
+        existing_job = _make_job_orm()
         mock_repo.get_by_source_url.return_value = existing_job
 
         result = await service.create_job(
@@ -188,7 +241,7 @@ class TestJobServiceCreate:
         mock_repo: AsyncMock,
     ) -> None:
         """无 source_url 时直接创建（不去重）"""
-        mock_repo.create.return_value = _make_job(source_url=None)
+        mock_repo.create.return_value = _make_job_orm(source_url=None)
 
         result = await service.create_job(
             title=SAMPLE_TITLE,
@@ -210,7 +263,7 @@ class TestJobServiceCreate:
     ) -> None:
         """创建岗位后提交事务"""
         mock_repo.get_by_source_url.return_value = None
-        mock_repo.create.return_value = _make_job()
+        mock_repo.create.return_value = _make_job_orm()
 
         await service.create_job(
             title=SAMPLE_TITLE,
@@ -234,7 +287,7 @@ class TestJobServiceGet:
         mock_repo: AsyncMock,
     ) -> None:
         """查询岗位 - 找到"""
-        mock_repo.get_by_id.return_value = _make_job()
+        mock_repo.get_by_id.return_value = _make_job_orm()
 
         result = await service.get_job(SAMPLE_JOB_ID)
 
@@ -265,7 +318,7 @@ class TestJobServiceList:
         mock_repo: AsyncMock,
     ) -> None:
         """分页查询岗位列表"""
-        jobs = [_make_job(), _make_job(id=uuid.uuid4())]
+        jobs = [_make_job_orm(), _make_job_orm(id=uuid.uuid4())]
         mock_repo.list.return_value = jobs
         mock_repo.count.return_value = 2
 
@@ -291,30 +344,118 @@ class TestJobServiceList:
         assert result.total == 0
 
 
-# ==================== Analyze Job ====================
+# ==================== Analyze Job（异步化版本）=================
 
 
 class TestJobServiceAnalyze:
-    """分析岗位测试"""
+    """分析岗位测试（Step 1.6.7 异步化契约）
 
-    async def test_analyze_job_basic(
+    异步化后 analyze_job 行为：
+    - 创建 Task(status=PENDING)
+    - Publisher 发送 MQ 消息
+    - 成功 → 返回 JobAnalyzeResponse(status="pending", task_id=...)
+    - 失败 + sync_fallback=True → 同步执行 Agent → 返回 completed
+    - 失败 + sync_fallback=False → 抛 MessageQueueError + mark_failed
+    """
+
+    async def test_analyze_job_cache_hit_returns_completed(
         self,
         service: JobService,
         mock_repo: AsyncMock,
-        mock_parser: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
     ) -> None:
-        """分析岗位 - 正常流程"""
-        job = _make_job(analysis_result=None)
-        mock_repo.get_by_id.return_value = job
-        mock_extractor.extract.return_value = MOCK_ANALYSIS_RESULT
+        """缓存命中时直接返回 completed（cached=True）
 
-        result = await service.analyze_job(SAMPLE_JOB_ID)
+        验收点：
+        - 不创建 Task
+        - 不发送 MQ
+        - 不调用 Agent
+        """
+        mock_repo.get_by_id.return_value = _make_job_orm()
+        mock_cache.get.return_value = MOCK_ANALYSIS_RESULT  # 缓存命中
 
-        assert isinstance(result, JobAnalysisResult)
-        assert result.skills == ["Python", "FastAPI", "PostgreSQL"]
-        mock_extractor.extract.assert_called_once()
-        mock_repo.update_analysis.assert_called_once()
+        result = await service.analyze_job(
+            SAMPLE_JOB_ID,
+            user_id=SAMPLE_USER_ID,
+            session_id=SAMPLE_SESSION_ID,
+        )
+
+        assert isinstance(result, JobAnalyzeResponse)
+        assert result.status == "completed"
+        assert result.cached is True
+        assert result.analysis_result is not None
+        assert result.analysis_result.skills == MOCK_ANALYSIS_RESULT.skills
+
+        # 不应创建 Task
+        mock_task_service.create_task.assert_not_awaited()
+        # 不应发送 MQ
+        mock_publisher.publish.assert_not_awaited()
+
+    async def test_analyze_job_db_existing_returns_completed(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
+    ) -> None:
+        """DB 已有分析结果时返回 completed（cached=False）"""
+        # DB 中已有 analysis_result
+        mock_repo.get_by_id.return_value = _make_job_orm(
+            analysis_result=MOCK_ANALYSIS_RESULT.model_dump()
+        )
+        mock_cache.get.return_value = None  # cache miss
+
+        result = await service.analyze_job(
+            SAMPLE_JOB_ID,
+            user_id=SAMPLE_USER_ID,
+            session_id=SAMPLE_SESSION_ID,
+        )
+
+        assert result.status == "completed"
+        assert result.cached is False
+        assert result.analysis_result is not None
+
+        # 不应创建 Task
+        mock_task_service.create_task.assert_not_awaited()
+
+    async def test_analyze_job_pending_returns_task_id(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
+    ) -> None:
+        """正常异步流程：创建 Task + 发 MQ → 返回 pending + task_id"""
+        mock_repo.get_by_id.return_value = _make_job_orm(analysis_result=None)
+        mock_cache.get.return_value = None
+        mock_task_service.create_task.return_value = _make_task_dto(TaskStatus.PENDING)
+
+        result = await service.analyze_job(
+            SAMPLE_JOB_ID,
+            user_id=SAMPLE_USER_ID,
+            session_id=SAMPLE_SESSION_ID,
+        )
+
+        assert isinstance(result, JobAnalyzeResponse)
+        assert result.status == "pending"
+        assert result.task_id == SAMPLE_TASK_ID
+
+        # 验证 Task 被创建（business_id 符合契约）
+        mock_task_service.create_task.assert_awaited_once()
+        create_call = mock_task_service.create_task.call_args
+        assert create_call.kwargs["task_type"] == "analyze_jd"
+        assert create_call.kwargs["business_id"] == SAMPLE_BUSINESS_ID
+        assert create_call.kwargs["user_id"] == SAMPLE_USER_ID
+        assert create_call.kwargs["session_id"] == SAMPLE_SESSION_ID
+
+        # 验证 MQ 消息被发送
+        mock_publisher.publish.assert_awaited_once()
+        publish_call = mock_publisher.publish.call_args
+        assert publish_call.kwargs["message_id"] == SAMPLE_BUSINESS_ID
 
     async def test_analyze_job_not_found(
         self,
@@ -325,89 +466,212 @@ class TestJobServiceAnalyze:
         mock_repo.get_by_id.return_value = None
 
         with pytest.raises(ResourceNotFoundError):
-            await service.analyze_job(SAMPLE_JOB_ID)
+            await service.analyze_job(
+                SAMPLE_JOB_ID,
+                user_id=SAMPLE_USER_ID,
+                session_id=SAMPLE_SESSION_ID,
+            )
 
-    async def test_analyze_job_already_analyzed(
+    async def test_analyze_job_force_invalidates_cache(
         self,
         service: JobService,
         mock_repo: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
     ) -> None:
-        """分析岗位 - 已有分析结果时跳过 LLM 调用"""
-        job = _make_job()  # analysis_result 已有值
-        mock_repo.get_by_id.return_value = job
+        """force=True 时先失效缓存，再走异步流程"""
+        # DB 和 cache 都有结果
+        mock_repo.get_by_id.return_value = _make_job_orm(
+            analysis_result=MOCK_ANALYSIS_RESULT.model_dump()
+        )
+        mock_cache.get.return_value = MOCK_ANALYSIS_RESULT
+        mock_task_service.create_task.return_value = _make_task_dto(TaskStatus.PENDING)
 
-        result = await service.analyze_job(SAMPLE_JOB_ID)
+        result = await service.analyze_job(
+            SAMPLE_JOB_ID,
+            user_id=SAMPLE_USER_ID,
+            session_id=SAMPLE_SESSION_ID,
+            force=True,
+        )
 
-        assert isinstance(result, JobAnalysisResult)
-        # 不应调用 extractor
-        mock_extractor.extract.assert_not_called()
+        # 验证缓存被失效
+        mock_cache.invalidate.assert_awaited_once_with(SAMPLE_JOB_ID)
 
-    async def test_analyze_job_force_reanalyze(
+        # 验证创建了新 Task（即使 DB/cache 都有结果）
+        mock_task_service.create_task.assert_awaited_once()
+
+        # 验证发送了 MQ
+        mock_publisher.publish.assert_awaited_once()
+
+        assert result.status == "pending"
+
+    async def test_analyze_job_mq_failure_with_sync_fallback(
         self,
         service: JobService,
         mock_repo: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
+        mock_agent_service: AsyncMock,
     ) -> None:
-        """分析岗位 - 强制重新分析"""
-        job = _make_job()  # 已有分析结果
-        mock_repo.get_by_id.return_value = job
-        mock_extractor.extract.return_value = MOCK_ANALYSIS_RESULT
+        """MQ 失败 + sync_fallback=True → 同步执行 Agent → completed"""
+        mock_repo.get_by_id.return_value = _make_job_orm(analysis_result=None)
+        mock_repo.update_analysis.return_value = _make_job_orm(
+            analysis_result=MOCK_ANALYSIS_RESULT.model_dump()
+        )
+        mock_cache.get.return_value = None
+        mock_task_service.create_task.return_value = _make_task_dto(TaskStatus.PENDING)
+        mock_publisher.publish.side_effect = ConnectionError("RabbitMQ 断连")
 
-        result = await service.analyze_job(SAMPLE_JOB_ID, force=True)
+        result = await service.analyze_job(
+            SAMPLE_JOB_ID,
+            user_id=SAMPLE_USER_ID,
+            session_id=SAMPLE_SESSION_ID,
+            sync_fallback=True,
+        )
 
-        assert isinstance(result, JobAnalysisResult)
-        mock_extractor.extract.assert_called_once()
+        # 验收：降级同步执行
+        assert result.status == "completed"
+        assert result.task_id == SAMPLE_TASK_ID
+        assert result.analysis_result is not None
 
-    async def test_analyze_job_saves_to_repo(
+        # Agent 被调用
+        mock_agent_service.analyze_job.assert_awaited_once()
+
+        # Task 被标记为完成
+        mock_task_service.mark_completed.assert_awaited_once()
+
+        # 缓存被回填
+        mock_cache.set.assert_awaited_once()
+
+    async def test_analyze_job_mq_failure_without_sync_fallback(
         self,
         service: JobService,
         mock_repo: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
+        mock_agent_service: AsyncMock,
     ) -> None:
-        """分析结果保存到 Repository"""
-        job = _make_job(analysis_result=None)
-        mock_repo.get_by_id.return_value = job
-        mock_extractor.extract.return_value = MOCK_ANALYSIS_RESULT
+        """MQ 失败 + sync_fallback=False → 抛 MessageQueueError + mark_failed"""
+        mock_repo.get_by_id.return_value = _make_job_orm(analysis_result=None)
+        mock_cache.get.return_value = None
+        mock_task_service.create_task.return_value = _make_task_dto(TaskStatus.PENDING)
+        mock_publisher.publish.side_effect = ConnectionError("RabbitMQ 断连")
 
-        await service.analyze_job(SAMPLE_JOB_ID)
+        with pytest.raises(MessageQueueError):
+            await service.analyze_job(
+                SAMPLE_JOB_ID,
+                user_id=SAMPLE_USER_ID,
+                session_id=SAMPLE_SESSION_ID,
+                sync_fallback=False,
+            )
 
-        # 验证 update_analysis 被调用，且传入了正确的参数
-        call_args = mock_repo.update_analysis.call_args
-        assert call_args[0][0] == job  # 第一个位置参数是 job
-        assert call_args[1]["analysis_result"] is not None
-        assert call_args[1]["skills"] == ["Python", "FastAPI", "PostgreSQL"]
-        assert call_args[1]["seniority"] == "senior"
+        # 验收：Task 被标记失败
+        mock_task_service.mark_failed.assert_awaited_once()
 
-    async def test_analyze_job_llm_failure(
+        # Agent 不应被调用
+        mock_agent_service.analyze_job.assert_not_awaited()
+
+        # mark_completed 不应被调用
+        mock_task_service.mark_completed.assert_not_awaited()
+
+    async def test_analyze_job_sync_fallback_agent_failure(
         self,
         service: JobService,
         mock_repo: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_task_service: AsyncMock,
+        mock_publisher: AsyncMock,
+        mock_agent_service: AsyncMock,
     ) -> None:
-        """分析岗位 - LLM 提取失败"""
-        job = _make_job(analysis_result=None)
-        mock_repo.get_by_id.return_value = job
-        mock_extractor.extract.side_effect = ExternalServiceError(
-            detail="LLM 调用失败",
-            error_code="EXT_003",
+        """同步降级时 Agent 失败 → mark_failed + 抛 ExternalServiceError"""
+        mock_repo.get_by_id.return_value = _make_job_orm(analysis_result=None)
+        mock_cache.get.return_value = None
+        mock_task_service.create_task.return_value = _make_task_dto(TaskStatus.PENDING)
+        mock_publisher.publish.side_effect = ConnectionError("RabbitMQ 断连")
+        # Agent 失败
+        mock_agent_service.analyze_job.return_value = AgentRunResult(
+            analysis=None,
+            agent_state=AgentState.FAILED,
+            error="LLM 调用超时",
         )
 
         with pytest.raises(ExternalServiceError):
-            await service.analyze_job(SAMPLE_JOB_ID)
+            await service.analyze_job(
+                SAMPLE_JOB_ID,
+                user_id=SAMPLE_USER_ID,
+                session_id=SAMPLE_SESSION_ID,
+                sync_fallback=True,
+            )
 
-    async def test_analyze_job_commits(
+        # 验收：Task 被标记失败
+        mock_task_service.mark_failed.assert_awaited_once()
+        failed_call = mock_task_service.mark_failed.call_args
+        assert "同步降级" in failed_call.kwargs.get("error_message", "")
+
+
+# ==================== Run Analysis（同步执行路径）=================
+
+
+class TestJobServiceRunAnalysis:
+    """run_analysis 测试：被 Consumer 和同步降级路径复用"""
+
+    async def test_run_analysis_success(
         self,
         service: JobService,
-        mock_session: AsyncMock,
         mock_repo: AsyncMock,
-        mock_extractor: AsyncMock,
+        mock_cache: AsyncMock,
+        mock_agent_service: AsyncMock,
     ) -> None:
-        """分析完成后提交事务"""
-        job = _make_job(analysis_result=None)
-        mock_repo.get_by_id.return_value = job
-        mock_extractor.extract.return_value = MOCK_ANALYSIS_RESULT
+        """同步执行分析成功：调用 Agent + 落库 + 写缓存"""
+        mock_repo.get_by_id.return_value = _make_job_orm()
+        mock_repo.update_analysis.return_value = _make_job_orm(
+            analysis_result=MOCK_ANALYSIS_RESULT.model_dump()
+        )
 
-        await service.analyze_job(SAMPLE_JOB_ID)
+        result = await service.run_analysis(SAMPLE_JOB_ID, SAMPLE_JD_TEXT, company=SAMPLE_COMPANY)
 
-        mock_session.commit.assert_called_once()
+        assert isinstance(result, JobAnalysisResult)
+        assert result.skills == MOCK_ANALYSIS_RESULT.skills
+
+        # 验证 Agent 被调用
+        mock_agent_service.analyze_job.assert_awaited_once_with(
+            jd_text=SAMPLE_JD_TEXT, company=SAMPLE_COMPANY
+        )
+
+        # 验证 DB 被更新
+        mock_repo.update_analysis.assert_awaited_once()
+
+        # 验证缓存被回填
+        mock_cache.set.assert_awaited_once()
+
+    async def test_run_analysis_job_not_found(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """run_analysis 时岗位不存在 → 抛 ResourceNotFoundError"""
+        mock_repo.get_by_id.return_value = None
+
+        with pytest.raises(ResourceNotFoundError):
+            await service.run_analysis(SAMPLE_JOB_ID, SAMPLE_JD_TEXT)
+
+    async def test_run_analysis_agent_failure(
+        self,
+        service: JobService,
+        mock_agent_service: AsyncMock,
+    ) -> None:
+        """Agent 失败 → 抛 ExternalServiceError"""
+        mock_agent_service.analyze_job.return_value = AgentRunResult(
+            analysis=None,
+            agent_state=AgentState.FAILED,
+            error="LLM 调用失败",
+        )
+
+        # get_by_id 在 run_analysis 末尾才被调用，所以这里也 mock
+        service._repo.get_by_id.return_value = _make_job_orm()
+
+        with pytest.raises(ExternalServiceError):
+            await service.run_analysis(SAMPLE_JOB_ID, SAMPLE_JD_TEXT)

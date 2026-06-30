@@ -10,22 +10,22 @@
 - POST /: 创建岗位（201 Created）
 - GET /: 岗位列表（200 OK，分页）
 - GET /{job_id}: 岗位详情（200 OK）
-- POST /analyze: 分析岗位（200 OK，同步版本；后续改造为 202 Accepted）
+- POST /analyze: 分析岗位（202 Accepted，异步返回 task_id）
 
 设计动机：
 - Router 不做业务逻辑：参数校验由 FastAPI 自动完成
-- 鉴权由全局 auth 中间件完成
-- 状态码语义：create=201, get/list=200, analyze=200（后续改 202）
+- 鉴权由全局 auth 中间件完成，user_id 从 request.state.user_id 读取
+- 状态码语义：create=201, get/list=200, analyze=202
 """
 
 import uuid
 
+from aio_pika.abc import AbstractRobustChannel
 from fastapi import APIRouter, Depends, Path, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logger import logger
 from app.domain.job.models import (
-    JobAnalysisResult,
     JobAnalyzeRequest,
     JobAnalyzeResponse,
     JobCreateRequest,
@@ -33,7 +33,10 @@ from app.domain.job.models import (
     JobResponse,
 )
 from app.domain.job.service import JobService
+from app.infra.cache.job_analysis import RedisJobAnalysisCache
 from app.infra.database.postgres import get_db_session
+from app.infra.message_queue import MessagePublisher
+from app.infra.message_queue.connection import get_rabbitmq_channel
 
 # ==================== Router 实例 ====================
 
@@ -97,7 +100,8 @@ async def create_job(
     description=(
         "分页返回岗位列表。\n\n"
         "- 默认按创建时间倒序（最新在前）\n"
-        "- 每页 1-100 条，默认 20 条"
+        "- 每页 1-100 条，默认 20 条\n"
+        "- 列表项为 JobSummary，不包含 jd_text 全文"
     ),
 )
 async def list_jobs(
@@ -169,38 +173,53 @@ async def get_job(
 
 @router.post(
     "/analyze",
-    response_model=JobAnalysisResult,
-    summary="分析岗位（提取技能/关键词/难度）",
+    response_model=JobAnalyzeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="分析岗位（异步）",
     description=(
-        "调用 LLM 分析 JD 文本，提取结构化信息。\n\n"
-        "- 同步版本：直接返回分析结果\n"
-        "- 后续改造为异步：返回 202 + task_id，结果通过 WebSocket 推送\n"
-        "- 已有分析结果时直接返回（force=true 强制重新分析）\n"
-        "- 不存在返回 404\n"
-        "- LLM 调用失败返回 502"
+        "触发 Job Analysis Agent 异步分析 JD 文本，提取结构化信息。\n\n"
+        "- 202 Accepted：任务已入队，返回 task_id 供前端轮询\n"
+        "- 缓存命中或 DB 已有结果时直接返回 completed（200 语义，但状态码仍为 202）\n"
+        "- RabbitMQ 不可用时降级为同步执行，返回 completed\n"
+        "- 轮询地址：GET /api/tasks/{task_id}\n"
+        "- force=true 强制重新分析（会失效缓存）\n"
+        "- 不存在返回 404，LLM 调用失败返回 502"
     ),
 )
 async def analyze_job(
+    request: Request,
     body: JobAnalyzeRequest,
     db: AsyncSession = Depends(get_db_session),
-) -> JobAnalysisResult:
+    channel: AbstractRobustChannel = Depends(get_rabbitmq_channel),
+) -> JobAnalyzeResponse:
     """分析岗位端点
 
     Args:
-        body: 分析请求（含 job_id）
+        request: FastAPI 请求对象（从中读取 user_id）
+        body: 分析请求（含 job_id / session_id）
         db: 请求级 AsyncSession
+        channel: RabbitMQ Channel（用于构造 Publisher）
 
     Returns:
-        JobAnalysisResult: 提取的结构化信息
+        JobAnalyzeResponse: pending 时返回 task_id；completed 时返回 analysis_result
 
     Raises:
         ResourceNotFoundError: 岗位不存在（中间件转 404）
+        MessageQueueError: MQ 不可用且未降级（中间件转 500/502）
         ExternalServiceError: LLM 调用失败（中间件转 502）
     """
-    logger.info("分析岗位端点 | job_id={}", body.job_id)
+    logger.info("分析岗位端点 | job_id={} | session_id={}", body.job_id, body.session_id)
 
-    service = JobService(db)
-    return await service.analyze_job(body.job_id)
+    user_id = uuid.UUID(request.state.user_id)
+    publisher = MessagePublisher(channel)
+    cache = RedisJobAnalysisCache()
+    service = JobService(db, publisher=publisher, cache=cache)
+
+    return await service.analyze_job(
+        job_id=body.job_id,
+        user_id=user_id,
+        session_id=body.session_id,
+    )
 
 
 __all__ = ["router"]
