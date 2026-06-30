@@ -157,7 +157,7 @@
 |------|------|---------|---------|
 | 1.5.1 | Resume DTO / Schema | `domain/resume/models.py` | 上传/响应/结构化数据 Model |
 | 1.5.2 | Resume Validator | `domain/resume/validator.py` | 文件类型/大小校验 |
-| 1.5.3 | Resume Parser Tool | `tools/file/resume_parser.py` | 解析 PDF/DOCX → 结构化 JSON |
+| 1.5.3 | Resume Reader Tool | `tools/file/resume_reader.py` | 解析 PDF/DOCX → 结构化 JSON |
 | 1.5.4 | PDF Reader | `tools/file/pdf_reader.py` | 异步读取 PDF 文本 |
 | 1.5.5 | DOCX Reader | `tools/file/docx_reader.py` | 异步读取 DOCX 文本 |
 | 1.5.6 | Resume Repository | `domain/resume/repository.py` + `infra/repositories/resume_repo.py` | CRUD，async |
@@ -170,9 +170,15 @@
 
 ---
 
-### Step 1.6 - 岗位模块 + Job Analysis Agent
+### Step 1.6 - 岗位模块 + Job Analysis Agent ✅ 已完成
 
 **目标**：岗位数据能存储，JD 能被 Agent 智能分析（F-003, F-004）
+
+**完成状态**（2026-06-30）：
+- 1.6.1~1.6.15 全部 15 个子任务交付完成
+- 核心交付：Job DTO/Parser/Extractor/Repository/Service（异步化）/Agent（状态机）/Router（202+task_id）/Cache（fail-open）/TaskService/Consumer（5 步流水线）/集成测试
+- 关键修复：`TaskService._VALID_TRANSITIONS` 允许 `PENDING → FAILED`，覆盖 MQ 投递失败 / Publisher 未注入 / 同步降级失败等「任务未开始即失败」场景
+- 测试覆盖：91 个核心测试用例全部通过（job_service / job_async_flow / job_analysis_consumer / task_service / match_models / match_scorer）
 
 | 序号 | 任务 | 涉及文件 | 验收标准 |
 |------|------|---------|---------|
@@ -183,11 +189,11 @@
 | 1.6.5 | Web Search Tool | `tools/retrieval/web_search.py` | 搜索公司信息补充分析 |
 | 1.6.6 | Job Repository | `domain/repositories/job.py` + `infra/repositories/job_repo.py` | CRUD + 按技能/关键词查询 |
 | 1.6.7 | Job Service（异步化） | `domain/job/service.py` | **不再同步执行 Agent**。流程：创建 Job → 创建 Task(status=pending) → Publisher 发送 `agent.task.job_analysis` 消息 → 返回 `{job_id, task_id}`。同步部分仅做参数校验与 Job/Task 落库。RabbitMQ 不可用时降级为同步执行并打 warning。 |
-| 1.6.8 | Job Analysis Agent | `domain/agent/service.py` | LangGraph 状态机：PARSING → EXTRACTING → ANALYZING → COMPLETED（**纯计算函数，被 Consumer 调用**） |
+| 1.6.8 | Job Analysis Agent | `domain/agent/service.py`（Facade）+ `domain/agent/job_analysis_agent.py`（实际状态机实现）+ `domain/agent/{prompts,policies,capabilities,models}.py`（预留扩展位） | LangGraph 状态机：PARSING → EXTRACTING → ANALYZING → COMPLETED（**纯计算函数，被 Consumer 调用**）。`service.py` 作为 AgentService Facade 统一对外暴露，`job_analysis_agent.py` 是 JobAnalysisAgent 具体实现（依赖注入 parser/extractor/web_search）。`prompts/policies/capabilities/models.py` 为后续 Agent 能力扩展预留，当前为空占位。 |
 | 1.6.9 | Agent State 定义 | `runtime/state/agent_state.py` | Agent 运行状态枚举与转换 |
-| 1.6.10 | Job Router | `api/routers/jobs.py` | POST /analyze 返回 `202 Accepted` + `{task_id}`；新增 GET /tasks/{task_id} 查询任务状态 |
-| 1.6.11 | 岗位模块测试 | `tests/` | 创建/分析/查询 正常+异常 用例 |
-| 1.6.12 | **Job 分析结果缓存（LLM 产物）** | `domain/repositories/job_analysis_cache.py` + `infra/cache/job_analysis_cache.py` + 改造 `domain/job/service.py` | 沿用 Resume 缓存的 **Protocol + Redis + fail-open** 统一模式，只缓存 Job Analysis Agent 的 LLM 产出（推理结果）。key=`job:analysis:{job_id}`，TTL=3600s（分析结果稳定，可设更长）。读路径:cache.get → miss 走 DB → setex 回填。写路径:Agent `COMPLETED` 时直接 setex 覆盖；仅缓存 `completed` 状态结果，`pending`/`failed`/`analyzing` 不缓存。 |
+| 1.6.10 | Job Router + Task Router | `api/routers/jobs.py` + `api/routers/task.py` | POST /analyze 返回 `202 Accepted` + `{task_id}`；GET /tasks/{task_id} 查询任务状态由 `task.py` 路由提供（复用 Step 1.6.13 TaskService） |
+| 1.6.11 | 岗位模块测试 | `tests/test_job_{parser,extractor,repo,service,router,analysis_agent,analysis_cache,analysis_consumer}.py` | 创建/分析/查询 正常+异常 用例；覆盖 Job Parser/Extractor/Repository/Service/Router/Agent/Cache/Consumer 各层单测 |
+| 1.6.12 | **Job 分析结果缓存（LLM 产物）** | `domain/cache/job.py` + `infra/cache/job_analysis.py` + 改造 `domain/job/service.py`（注：原计划路径 `domain/repositories/job_analysis_cache.py` + `infra/cache/job_analysis_cache.py` 在 DDD 架构优化后调整为 `domain/cache/` + `infra/cache/` 命名空间，与 Resume 缓存结构对齐） | 沿用 Resume 缓存的 **Protocol + Redis + fail-open** 统一模式，只缓存 Job Analysis Agent 的 LLM 产出（推理结果）。key=`job:analysis:{job_id}`，TTL=3600s（分析结果稳定，可设更长）。读路径:cache.get → miss 走 DB → setex 回填。写路径:Agent `COMPLETED` 时直接 setex 覆盖；仅缓存 `completed` 状态结果，`pending`/`failed`/`analyzing` 不缓存。 |
 | 1.6.13 | **Task Service（异步任务编排）** | `domain/task/service.py` + `infra/repositories/task_repo.py` | 任务生命周期管理：`create_task(type, payload)`、`mark_running(task_id)`、`mark_completed(task_id, result)`、`mark_failed(task_id, error)`、`get_task(task_id)`、`list_tasks(user_id, status, page)`。Task 表复用 Step 1.2.6。 |
 | 1.6.14 | **Job Analysis Consumer** | `infra/message_queue/handlers/job_analysis.py` | 订阅 `copilot.agent.job_analysis`：1) `mark_running`；2) 调用 Job Analysis Agent（Step 1.6.8）；3) 落库 `Job.analysis_result` + 写缓存（Step 1.6.12）；4) `mark_completed`；5) Publisher 发 `agent.event.completed(task_id, result)`。失败重试 3 次后入死信。注册到 Step 1.1.14 Registry。 |
 | 1.6.15 | **Job 异步流程集成测试** | `tests/test_job_async_flow.py` | 标记 `@pytest.mark.integration`：POST /analyze → 断言 202+task_id → 等待 Consumer 处理 → 断言 Task=completed + Job.analysis_result 非空 + cache 命中 + WebSocket 收到 event 通知（用 test client 模拟 WS）。 |
