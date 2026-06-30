@@ -115,7 +115,17 @@ async def test_on_message_success_acks() -> None:
 
     await consumer._on_message(msg)
 
-    handler.assert_awaited_once_with({"key": "value"})
+    # consumer 基类会注入 __mq_meta__ 元数据，供 handler 感知重试状态
+    handler.assert_awaited_once_with(
+        {
+            "key": "value",
+            "__mq_meta__": {
+                "retry_count": 0,
+                "max_retries": 3,
+                "queue": "test.queue",
+            },
+        }
+    )
     msg.ack.assert_awaited_once()
     msg.nack.assert_not_awaited()
     assert consumer._in_flight == 0  # 正常递减
@@ -147,8 +157,17 @@ async def test_on_message_failure_publishes_to_retry_exchange() -> None:
 
     await consumer._on_message(msg)
 
-    # handler 被调用
-    handler.assert_awaited_once_with({"task_id": "123"})
+    # handler 被调用；consumer 基类注入 __mq_meta__ 元数据
+    handler.assert_awaited_once_with(
+        {
+            "task_id": "123",
+            "__mq_meta__": {
+                "retry_count": 1,
+                "max_retries": 3,
+                "queue": "test.queue",
+            },
+        }
+    )
 
     # publish 到 retry exchange（不是 nack requeue）
     retry_exchange.publish.assert_awaited_once()

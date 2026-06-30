@@ -216,6 +216,14 @@ class MessageConsumer(ABC):
             # 读取重试次数（首次消费时 header 中无此字段，默认为 0）
             retry_count = self._get_retry_count(message)
 
+            # 把 MQ 元数据注入 body，供业务 handler 感知重试状态
+            # 使用 __mq_meta__ 嵌套字段，避免污染业务 payload 的顶层 key
+            body["__mq_meta__"] = {
+                "retry_count": retry_count,
+                "max_retries": self._max_retries,
+                "queue": self._queue_name,
+            }
+
             try:
                 await self.handle_message(body)
                 # 业务处理成功，确认消息，Broker 不再投递
