@@ -120,6 +120,28 @@ class PgSessionFactory:
             self._engine = None
             self._session_factory = None
 
+    async def __aenter__(self) -> AsyncSession:
+        """异步上下文管理器入口：创建新 session
+
+        使用方式：
+            async with pg_session_factory() as session:
+                ...
+
+        注意：
+        - 本上下文管理器只负责 session 创建和关闭，不自动 commit/rollback
+        - 事务边界由调用方显式控制（与 get_db_session 保持一致）
+        """
+        self._ctx_session = self.create_session()
+        return self._ctx_session
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """异步上下文管理器出口：关闭 session
+
+        无论是否发生异常，都确保 session.close() 被调用，避免连接泄漏。
+        异常处理由调用方负责，此处不自动 rollback/commit。
+        """
+        await self._ctx_session.close()
+
 
 # 模块级单例：整个应用共享同一个工厂和 Engine
 pg_session_factory = PgSessionFactory()

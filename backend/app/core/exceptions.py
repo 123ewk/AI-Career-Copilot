@@ -138,6 +138,17 @@ class ConflictError(BusinessException):
     detail = "资源冲突"
 
 
+class TaskStateError(ConflictError):
+    """任务状态机非法转换 (409)
+
+    场景：Consumer 尝试将 PENDING 任务直接标记为 COMPLETED，
+    或 COMPLETED 任务再次标记为 RUNNING 等违反状态流转规则的操作。
+    """
+    status_code = 409
+    error_code = "TASK_001"
+    detail = "任务状态不允许此操作"
+
+
 class RateLimitError(BusinessException):
     """请求限流 (429)
 
