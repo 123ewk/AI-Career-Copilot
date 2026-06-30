@@ -3,26 +3,28 @@
 职责：
 - 测试 TaskService 的业务编排逻辑
 - Mock TaskRepository 避免真实数据库依赖
-- 覆盖任务生命周期：创建、状态更新、查询
+- Mock insert_idempotent 避免 AsyncSession 默认值问题
+- 覆盖任务生命周期：创建、状态更新、查询、状态机非法转换
 
 测试策略：
 - Mock TaskRepository：验证 Service 正确调用 repo 方法
+- Mock insert_idempotent：验证 Service 正确构造 Task 参数
 - 验证 commit 时机：只有写操作才 commit
-- 验证异常翻译：ResourceNotFoundError 正确抛出
+- 验证异常翻译：ResourceNotFoundError / TaskStateError 正确抛出
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.core.exceptions import ResourceNotFoundError
+from app.core.exceptions import ConflictError, ResourceNotFoundError, TaskStateError
+from app.domain.task.dto import TaskDTO, TaskListResponse
 from app.domain.task.service import TaskService
 from app.infra.database.models.task import Task, TaskStatus
-
 
 # ==================== Fixtures ====================
 
@@ -50,6 +52,8 @@ def service(mock_session: AsyncMock, mock_repo: AsyncMock) -> TaskService:
 SAMPLE_USER_ID = uuid.uuid4()
 SAMPLE_SESSION_ID = uuid.uuid4()
 SAMPLE_TASK_ID = uuid.uuid4()
+SAMPLE_CREATED_AT = datetime(2026, 1, 1, 12, 0, 0)
+SAMPLE_UPDATED_AT = datetime(2026, 1, 1, 12, 0, 1)
 
 
 def _make_task(**overrides) -> Task:
@@ -64,8 +68,8 @@ def _make_task(**overrides) -> Task:
         "input_data": {"job_id": "job-123"},
         "result": None,
         "error_message": None,
-        "created_at": datetime(2026, 1, 1, 12, 0, 0),
-        "updated_at": datetime(2026, 1, 1, 12, 0, 0),
+        "created_at": SAMPLE_CREATED_AT,
+        "updated_at": SAMPLE_UPDATED_AT,
     }
     defaults.update(overrides)
     return Task(**defaults)
@@ -77,15 +81,16 @@ def _make_task(**overrides) -> Task:
 class TestTaskServiceCreate:
     """创建任务测试"""
 
+    @patch("app.domain.task.service.insert_idempotent")
     async def test_create_task_success(
         self,
+        mock_insert: MagicMock,
         service: TaskService,
-        mock_repo: AsyncMock,
         mock_session: AsyncMock,
     ) -> None:
-        """创建任务成功：调用 repo + commit"""
-        expected = _make_task()
-        mock_repo.create.return_value = expected
+        """创建任务成功：调用 insert_idempotent + commit + 返回 TaskDTO"""
+        expected_task = _make_task()
+        mock_insert.return_value = expected_task
 
         result = await service.create_task(
             user_id=SAMPLE_USER_ID,
@@ -95,19 +100,44 @@ class TestTaskServiceCreate:
             input_data={"job_id": "job-123"},
         )
 
-        assert result == expected
-        mock_repo.create.assert_awaited_once()
+        assert isinstance(result, TaskDTO)
+        assert result.id == SAMPLE_TASK_ID
+        assert result.status == TaskStatus.PENDING
+        mock_insert.assert_awaited_once()
         mock_session.commit.assert_awaited_once()
 
+    @patch("app.domain.task.service.insert_idempotent")
+    async def test_create_task_duplicate(
+        self,
+        mock_insert: MagicMock,
+        service: TaskService,
+    ) -> None:
+        """business_id 重复时抛 ConflictError"""
+        from app.core.exceptions import DuplicateMessageError
+
+        mock_insert.side_effect = DuplicateMessageError(
+            message_id="analyze_jd:job-123",
+        )
+
+        with pytest.raises(ConflictError):
+            await service.create_task(
+                user_id=SAMPLE_USER_ID,
+                session_id=SAMPLE_SESSION_ID,
+                task_type="analyze_jd",
+                business_id="analyze_jd:job-123",
+            )
+
+    @patch("app.domain.task.service.insert_idempotent")
     async def test_create_task_passes_all_params(
         self,
-        service: TaskService,
-        mock_repo: AsyncMock,
+        mock_insert: MagicMock,
     ) -> None:
-        """参数正确传递到 repo"""
-        mock_repo.create.return_value = _make_task()
+        """参数正确传递到 insert_idempotent"""
+        mock_insert.return_value = _make_task()
+        session = AsyncMock()
+        svc = TaskService(session)
 
-        await service.create_task(
+        await svc.create_task(
             user_id=SAMPLE_USER_ID,
             session_id=SAMPLE_SESSION_ID,
             task_type="match_resume",
@@ -115,11 +145,15 @@ class TestTaskServiceCreate:
             input_data={"job_id": "j1", "resume_id": "r1"},
         )
 
-        call_kwargs = mock_repo.create.call_args.kwargs
-        assert call_kwargs["user_id"] == SAMPLE_USER_ID
-        assert call_kwargs["session_id"] == SAMPLE_SESSION_ID
-        assert call_kwargs["task_type"] == "match_resume"
-        assert call_kwargs["business_id"] == "match:resume-456"
+        call_args = mock_insert.call_args
+        assert call_args.args[0] is session  # 第一个位置参数是 session
+        assert call_args.args[1] is Task     # 第二个位置参数是 Task Model
+        kwargs = call_args.kwargs
+        assert kwargs["user_id"] == SAMPLE_USER_ID
+        assert kwargs["session_id"] == SAMPLE_SESSION_ID
+        assert kwargs["task_type"] == "match_resume"
+        assert kwargs["business_id"] == "match:resume-456"
+        assert kwargs["status"] == TaskStatus.PENDING
 
 
 # ==================== Mark Running ====================
@@ -134,12 +168,14 @@ class TestTaskServiceMarkRunning:
         mock_repo: AsyncMock,
         mock_session: AsyncMock,
     ) -> None:
-        """标记运行中：调用 repo + commit"""
+        """标记运行中：调用 repo + commit + 返回 TaskDTO"""
         task = _make_task()
         mock_repo.get_by_id.return_value = task
+        mock_repo.mark_running.return_value = task
 
-        await service.mark_running(SAMPLE_TASK_ID)
+        result = await service.mark_running(SAMPLE_TASK_ID)
 
+        assert isinstance(result, TaskDTO)
         mock_repo.mark_running.assert_awaited_once_with(task)
         mock_session.commit.assert_awaited_once()
 
@@ -152,6 +188,17 @@ class TestTaskServiceMarkRunning:
         mock_repo.get_by_id.return_value = None
 
         with pytest.raises(ResourceNotFoundError):
+            await service.mark_running(SAMPLE_TASK_ID)
+
+    async def test_mark_running_invalid_state(
+        self,
+        service: TaskService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """非 PENDING 任务不能 mark_running"""
+        mock_repo.get_by_id.return_value = _make_task(status=TaskStatus.COMPLETED)
+
+        with pytest.raises(TaskStateError):
             await service.mark_running(SAMPLE_TASK_ID)
 
 
@@ -167,13 +214,15 @@ class TestTaskServiceMarkCompleted:
         mock_repo: AsyncMock,
         mock_session: AsyncMock,
     ) -> None:
-        """标记完成：调用 repo + commit"""
+        """标记完成：调用 repo + commit + 返回 TaskDTO"""
         task = _make_task(status=TaskStatus.RUNNING)
         mock_repo.get_by_id.return_value = task
+        mock_repo.mark_completed.return_value = task
         result_data = {"skills": ["Python"], "difficulty": "medium"}
 
-        await service.mark_completed(SAMPLE_TASK_ID, result=result_data)
+        result = await service.mark_completed(SAMPLE_TASK_ID, result=result_data)
 
+        assert isinstance(result, TaskDTO)
         mock_repo.mark_completed.assert_awaited_once_with(task, result=result_data)
         mock_session.commit.assert_awaited_once()
 
@@ -188,6 +237,17 @@ class TestTaskServiceMarkCompleted:
         with pytest.raises(ResourceNotFoundError):
             await service.mark_completed(SAMPLE_TASK_ID, result={})
 
+    async def test_mark_completed_invalid_state(
+        self,
+        service: TaskService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """非 RUNNING 任务不能 mark_completed"""
+        mock_repo.get_by_id.return_value = _make_task(status=TaskStatus.PENDING)
+
+        with pytest.raises(TaskStateError):
+            await service.mark_completed(SAMPLE_TASK_ID, result={})
+
 
 # ==================== Mark Failed ====================
 
@@ -195,19 +255,44 @@ class TestTaskServiceMarkCompleted:
 class TestTaskServiceMarkFailed:
     """标记任务失败测试"""
 
-    async def test_mark_failed_success(
+    async def test_mark_failed_success_from_running(
         self,
         service: TaskService,
         mock_repo: AsyncMock,
         mock_session: AsyncMock,
     ) -> None:
-        """标记失败：调用 repo + commit"""
+        """RUNNING → FAILED：执行中失败（如 Agent 异常 / 超时）"""
         task = _make_task(status=TaskStatus.RUNNING)
         mock_repo.get_by_id.return_value = task
+        mock_repo.mark_failed.return_value = task
         error_msg = "LLM 调用超时"
 
-        await service.mark_failed(SAMPLE_TASK_ID, error_message=error_msg)
+        result = await service.mark_failed(SAMPLE_TASK_ID, error_message=error_msg)
 
+        assert isinstance(result, TaskDTO)
+        mock_repo.mark_failed.assert_awaited_once_with(task, error_message=error_msg)
+        mock_session.commit.assert_awaited_once()
+
+    async def test_mark_failed_success_from_pending(
+        self,
+        service: TaskService,
+        mock_repo: AsyncMock,
+        mock_session: AsyncMock,
+    ) -> None:
+        """PENDING → FAILED：未开始即失败（如 MQ 投递失败 / Publisher 未注入）
+
+        覆盖 JobService.analyze_job 中 sync_fallback=False 时直接 mark_failed 的场景。
+        修复前 _VALID_TRANSITIONS 不允许此转换，会抛 TaskStateError；
+        修复后允许 PENDING → FAILED，避免 API 层错误吞掉。
+        """
+        task = _make_task(status=TaskStatus.PENDING)
+        mock_repo.get_by_id.return_value = task
+        mock_repo.mark_failed.return_value = task
+        error_msg = "MQ 发布失败"
+
+        result = await service.mark_failed(SAMPLE_TASK_ID, error_message=error_msg)
+
+        assert isinstance(result, TaskDTO)
         mock_repo.mark_failed.assert_awaited_once_with(task, error_message=error_msg)
         mock_session.commit.assert_awaited_once()
 
@@ -222,6 +307,17 @@ class TestTaskServiceMarkFailed:
         with pytest.raises(ResourceNotFoundError):
             await service.mark_failed(SAMPLE_TASK_ID, error_message="error")
 
+    async def test_mark_failed_invalid_state(
+        self,
+        service: TaskService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """COMPLETED / FAILED / CANCELLED 状态不能 mark_failed"""
+        mock_repo.get_by_id.return_value = _make_task(status=TaskStatus.COMPLETED)
+
+        with pytest.raises(TaskStateError):
+            await service.mark_failed(SAMPLE_TASK_ID, error_message="error")
+
 
 # ==================== Get Task ====================
 
@@ -234,13 +330,14 @@ class TestTaskServiceGet:
         service: TaskService,
         mock_repo: AsyncMock,
     ) -> None:
-        """查询成功返回 Task"""
+        """查询成功返回 TaskDTO"""
         expected = _make_task()
         mock_repo.get_by_id.return_value = expected
 
         result = await service.get_task(SAMPLE_TASK_ID)
 
-        assert result == expected
+        assert isinstance(result, TaskDTO)
+        assert result.id == SAMPLE_TASK_ID
 
     async def test_get_task_not_found(
         self,
@@ -265,14 +362,16 @@ class TestTaskServiceList:
         service: TaskService,
         mock_repo: AsyncMock,
     ) -> None:
-        """默认分页查询"""
+        """默认分页查询返回 TaskListResponse"""
         mock_repo.list_by_user.return_value = [_make_task()]
         mock_repo.count_by_user.return_value = 1
 
         result = await service.list_tasks(user_id=SAMPLE_USER_ID)
 
-        assert result["total"] == 1
-        assert len(result["items"]) == 1
+        assert isinstance(result, TaskListResponse)
+        assert result.total == 1
+        assert len(result.items) == 1
+        assert isinstance(result.items[0], TaskDTO)
         mock_repo.list_by_user.assert_awaited_once_with(
             SAMPLE_USER_ID, status=None, limit=20, offset=0,
         )
@@ -291,7 +390,7 @@ class TestTaskServiceList:
             status=TaskStatus.RUNNING,
         )
 
-        assert result["total"] == 0
+        assert result.total == 0
         mock_repo.list_by_user.assert_awaited_once_with(
             SAMPLE_USER_ID, status=TaskStatus.RUNNING, limit=20, offset=0,
         )
