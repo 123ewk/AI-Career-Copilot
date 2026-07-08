@@ -156,10 +156,12 @@ async def handle_job_analysis(body: dict) -> None:
             raise  # 非末次重试时让 consumer 基类继续重试
 
         # ---- Step 3: mark_completed ----
+        # mode="json"：将 UUID/datetime 等不可 JSON 序列化的类型转为字符串，
+        # 避免 PostgreSQL JSONB 写入时抛 "Object of type UUID is not JSON serializable"
         try:
             await task_service.mark_completed(
                 task_id,
-                result=analysis.model_dump(),
+                result=analysis.model_dump(mode="json"),
             )
         except Exception as exc:
             logger.error(
@@ -184,7 +186,7 @@ async def handle_job_analysis(body: dict) -> None:
                     "task_id": str(task_id),
                     "job_id": str(job_id),
                     "business_id": business_id,
-                    "result": analysis.model_dump(),
+                    "result": analysis.model_dump(mode="json"),
                 },
                 # message_id 复用业务幂等键 business_id，与任务创建侧保持一致
                 message_id=business_id,

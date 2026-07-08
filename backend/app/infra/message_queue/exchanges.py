@@ -107,6 +107,7 @@ QUEUE_MATCH_COMPUTE = "copilot.match.compute"
 
 # Agent 任务队列
 QUEUE_AGENT_JOB_ANALYSIS = "copilot.agent.job_analysis"
+QUEUE_AGENT_COMMUNICATION = "copilot.agent.communication"
 
 # Agent 事件队列（Step 1.6.14 完成事件，Step 1.10.8 Notification Consumer 订阅）
 QUEUE_AGENT_EVENT_COMPLETED = "copilot.agent.event.completed"
@@ -132,6 +133,7 @@ ROUTING_MATCH_COMPUTE = "match.compute"
 
 # Agent Routing Key
 ROUTING_AGENT_JOB_ANALYSIS = "agent.job_analysis"
+ROUTING_AGENT_COMMUNICATION = "agent.communication"
 ROUTING_AGENT_EVENT_COMPLETED = "agent.event.completed"
 
 # ==================== 重试队列映射 ====================
@@ -334,6 +336,14 @@ async def declare_all(channel: AbstractRobustChannel) -> None:
         queue_name=QUEUE_AGENT_JOB_ANALYSIS,
         routing_key=ROUTING_AGENT_JOB_ANALYSIS,
         # Agent 任务 TTL 2 小时（LLM 调用可能耗时较长）
+        queue_message_ttl_ms=2 * 3600 * 1000,
+    )
+    await _declare_main_queue_with_retry(
+        channel,
+        main_exchange_name=EXCHANGE_AGENT,
+        main_exchange_type=ExchangeType.TOPIC,
+        queue_name=QUEUE_AGENT_COMMUNICATION,
+        routing_key=ROUTING_AGENT_COMMUNICATION,
         queue_message_ttl_ms=2 * 3600 * 1000,
     )
 

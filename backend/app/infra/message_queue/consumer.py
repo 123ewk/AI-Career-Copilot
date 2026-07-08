@@ -378,14 +378,13 @@ class MessageConsumer(ABC):
             await message.ack()
 
             logger.warning(
-                "消息处理失败，已发到重试队列",
-                extra={
-                    "queue": self._queue_name,
-                    "retry_count": new_retry_count,
-                    "max_retries": self._max_retries,
-                    "retry_ttl_ms": retry_ttl_ms,
-                    "error": str(error),
-                },
+                "消息处理失败，已发到重试队列 | queue={} | retry={}/{} | "
+                "error_type={} | error={}",
+                self._queue_name,
+                new_retry_count,
+                self._max_retries,
+                type(error).__name__,
+                str(error)[:500],
             )
 
         except Exception as publish_error:
