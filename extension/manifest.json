@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "AI Career Copilot",
+  "version": "0.0.1",
+  "description": "AI 求职助手浏览器扩展 - Boss 直聘海投模式",
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://www.zhipin.com/*",
+    "http://localhost:8000/*"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["interceptor.js"],
+      "matches": ["https://www.zhipin.com/*"]
+    }
+  ],
+  "background": {
+    "service_worker": "src/background/service_worker.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.zhipin.com/*"],
+      "js": ["src/content/content.ts"],
+      "run_at": "document_start"
+    }
+  ]
+}
