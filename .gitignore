@@ -84,6 +84,9 @@ tmp/
 temp/
 *.tmp
 
+# ===== 性能基准测试结果 =====
+backend/benchmarks/results/
+
 # ===== 文档构建产物 =====
 docs/_build/
 docs/八股文/
@@ -95,6 +98,11 @@ backend/_*.py
 
 # ===== 临时调试脚本（debug_ 前缀，一次性排查用） =====
 backend/tests/debug_*.py
+
+# ===== 本地检测/检查/数据库巡检脚本（不提交） =====
+backend/check_*.py
+backend/inspect_*.py
+backend/detect_*.py
 
 # ===== AI 工具配置（不同 IDE/工具生成的本地指引，团队共享工程无需） =====
 CLAUDE.md
@@ -144,3 +152,16 @@ storage/
 # *.h5
 # *.pt
 # *.onnx
+
+# ===== 本地临时数据与试验目录 =====
+# Boss 页面 HTML 原始快照（调试抓取用，不提交）
+_boss_web_html/
+
+# 本地 PowerShell 启动脚本（含个人环境/路径）
+start.ps1
+
+# 性能基准测试目录整体忽略（结果数据已在上面 results/ 中忽略）
+backend/benchmarks/
+
+# 扩展 v2 试验目录
+extension-v2/

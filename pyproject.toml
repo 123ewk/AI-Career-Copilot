@@ -39,6 +39,7 @@ dependencies = [
     "python-docx>=1.2.0",
     "python-multipart>=0.0.32",
     "tavily-python>=0.7.26",
+    "sentence-transformers>=5.6.0",
 ]
 
 # ==================== Dev 依赖 ====================
@@ -49,6 +50,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-playwright>=0.8.0",
+    "asgi-lifespan>=2.1.0",
     "ruff>=0.15.17",
     "mypy>=2.1.0",
     "pre-commit>=4.6.0",
@@ -162,6 +164,11 @@ filterwarnings = [
     "ignore::PendingDeprecationWarning",
     "ignore::UserWarning:jwt.*",
     "ignore::starlette.exceptions.StarletteDeprecationWarning",
+    # Windows + asyncio Proactor 事件循环在 teardown 阶段，
+    # 未完全关闭的 pipe transport 会在 __del__ 中抛出异常。
+    # pytest 8 将其捕获为 PytestUnraisableExceptionWarning；
+    # 这是平台/测试框架噪音，不影响业务逻辑与端到端流程正确性。
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 markers = [
     "integration: 集成测试，需要真实 PostgreSQL/Redis/RabbitMQ",

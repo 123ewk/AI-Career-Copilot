@@ -45,4 +45,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 # 启动 FastAPI 应用
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 先用 alembic 执行数据库迁移（-c 指定 alembic.ini 位置），再启动 uvicorn
+# 这样容器首次启动时会自动创建表结构，避免手动跑迁移
+CMD ["sh", "-c", "alembic -c backend/alembic.ini upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000"]
