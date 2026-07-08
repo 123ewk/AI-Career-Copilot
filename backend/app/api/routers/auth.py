@@ -74,7 +74,6 @@ from app.infra.database.postgres import get_db_session
 # ==================== Router 实例 ====================
 
 router = APIRouter(
-    prefix="/api/auth",
     tags=["auth"],
     # 当前所有 auth 端点均为匿名访问；未来若新增需要鉴权的 auth 端点（如 /logout），
     # 单独打装饰器或新建 router，不要在中间件白名单里直接加 path

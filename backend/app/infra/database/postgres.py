@@ -120,6 +120,20 @@ class PgSessionFactory:
             self._engine = None
             self._session_factory = None
 
+    def __call__(self) -> "PgSessionFactory":
+        """使工厂实例可直接用于 async with
+
+        为什么需要 __call__：
+        - 业务代码习惯写成 `async with pg_session_factory() as session:`
+        - 如果不实现 __call__，实例本身不可调用，会报 TypeError
+        - 返回 self 后，async with 会走实例的 __aenter__/__aexit__
+
+        注意：
+        - 返回 self 而非新 session，确保上下文管理器生命周期由实例控制
+        - 与直接 `async with pg_session_factory` 语义等价
+        """
+        return self
+
     async def __aenter__(self) -> AsyncSession:
         """异步上下文管理器入口：创建新 session
 

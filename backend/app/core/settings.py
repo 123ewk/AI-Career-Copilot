@@ -12,10 +12,16 @@
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+
+# 锁定 .env 文件位置：backend/app/configs/.env
+# settings.py 位于 backend/app/core/，向上退一级到 backend/app/ 后再进 configs
+_ENV_FILE_PATH: Path = Path(__file__).resolve().parents[1] / "configs" / ".env"
 
 
 class Settings(BaseSettings):
@@ -26,7 +32,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE_PATH),
         env_file_encoding="utf-8",
         case_sensitive=False,  # 环境变量不区分大小写
         extra="ignore",
@@ -166,6 +172,44 @@ class Settings(BaseSettings):
     # 过大：调试期间改 header 需手动清缓存；过小：频繁预检增加延迟
     cors_max_age_seconds: int = 600
 
+    # ==================== 匹配模块（Step 1.7）====================
+    # BM25 与语义匹配的默认权重，影响 CombinedScorer 的默认行为
+    # 权重和必须等于 1.0，由 model_validator 校验
+    match_bm25_weight: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description="BM25 匹配权重",
+    )
+    match_semantic_weight: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="语义相似度权重",
+    )
+
+    # 句向量模型：支持 HuggingFace 模型名（自动下载缓存）或本地绝对路径
+    # 示例本地路径：E:\\MoTa_model\\XiangLiang\\bge-small-zh-v1.5
+    sentence_transformer_model: str = Field(
+        default="BAAI/bge-small-zh-v1.5",
+        description="句向量模型名或本地路径",
+    )
+
+    # 是否启用语义匹配：关闭时 CombinedScorer 自动使用 NullEmbeddingBackend
+    # 用途：模型未就绪或压测纯 BM25 场景
+    semantic_scorer_enabled: bool = Field(
+        default=True,
+        description="是否启用语义匹配",
+    )
+
+    # BM25 归一化缩放系数：控制 raw score 到 [0, 100] 的映射
+    # 越大越"严格"，越小对命中词越敏感
+    match_bm25_scale: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="BM25 归一化缩放系数",
+    )
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     # 方法上必须加 @classmethod，这是 Pydantic field_validator 的要求
@@ -182,6 +226,23 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @model_validator(mode="after")
+    def _check_match_weights(self) -> "Settings":
+        """校验匹配权重和为 1.0
+
+        为什么需要：
+        - 两个权重独立从环境变量读取，必须保证融合公式语义正确
+        - 浮点数比较允许 1e-6 误差
+        """
+        total = self.match_bm25_weight + self.match_semantic_weight
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"MATCH_BM25_WEIGHT ({self.match_bm25_weight}) 与 "
+                f"MATCH_SEMANTIC_WEIGHT ({self.match_semantic_weight}) 之和必须等于 1.0，"
+                f"当前为 {total}"
+            )
+        return self
 
 
 @lru_cache

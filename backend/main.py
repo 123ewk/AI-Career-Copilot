@@ -34,14 +34,30 @@ from app.api.middleware.exception import add_exception_middleware
 from app.api.middleware.logging import add_logging_middleware
 from app.api.middleware.rate_limit import add_rate_limit_middleware
 from app.api.middleware.request_id import add_request_id_middleware
-from app.api.routers import agent, auth, jobs, match, resume, session, task, user, workflow
+from app.api.routers import (
+    agent,
+    applications,
+    auth,
+    communication,
+    health,
+    jobs,
+    match,
+    resume,
+    session,
+    task,
+    user,
+    workflow,
+)
 from app.core.logger import logger, setup_logging
 from app.core.settings import get_settings
 from app.infra.database.postgres import pg_session_factory
 from app.infra.database.redis import redis_client_factory
 from app.infra.message_queue.connection import rabbitmq_connection_factory
 from app.infra.message_queue.exchanges import declare_all
-from app.infra.message_queue.handlers import job_analysis  # noqa: F401  触发 @register
+from app.infra.message_queue.handlers import (
+    communication as communication_handler,  # noqa: F401  触发 @register
+    job_analysis,  # noqa: F401  触发 @register
+)
 from app.infra.message_queue.registry import consumer_manager
 
 # ==================== Lifespan ====================
@@ -197,11 +213,15 @@ def create_app() -> FastAPI:
     add_auth_middleware(app)
 
     # ---- 挂载路由 ----
+    # 健康检查放根路径 /health，不挂 /api 前缀，方便探针和 Docker HEALTHCHECK 访问
+    app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
     app.include_router(user.router, prefix="/api/users", tags=["用户"])
     app.include_router(resume.router, prefix="/api/resumes", tags=["简历"])
     app.include_router(jobs.router, prefix="/api/jobs", tags=["岗位"])
     app.include_router(match.router, prefix="/api/match", tags=["匹配"])
+    app.include_router(communication.router, prefix="/api/communication", tags=["沟通话术"])
+    app.include_router(applications.router, prefix="/api/applications", tags=["投递记录"])
     app.include_router(session.router, prefix="/api/sessions", tags=["会话"])
     app.include_router(task.router, prefix="/api/tasks", tags=["任务"])
     app.include_router(agent.router, prefix="/api/agent", tags=["Agent"])

@@ -31,6 +31,7 @@ from app.domain.job.models import (
     JobCreateRequest,
     JobListResponse,
     JobResponse,
+    JobUpdateRequest,
 )
 from app.domain.job.service import JobService
 from app.infra.cache.job_analysis import RedisJobAnalysisCache
@@ -82,6 +83,7 @@ async def create_job(
         source_url=body.source_url,
         salary_min=body.salary_min,
         salary_max=body.salary_max,
+        salary_unit=body.salary_unit,
         location=body.location,
         skills=body.skills,
         keywords=body.keywords,
@@ -166,6 +168,59 @@ async def get_job(
     """
     service = JobService(db)
     return await service.get_job(job_id)
+
+
+# ==================== 端点：部分更新岗位 ====================
+
+
+@router.patch(
+    "/{job_id}",
+    response_model=JobResponse,
+    summary="部分更新岗位",
+    description=(
+        "部分更新岗位字段（PATCH 语义：仅更新传入字段）。\n\n"
+        "- 海投模式：用户点击卡片加载详情后，调用此接口补充 jd_text / skills / location\n"
+        "- 不允许更新 source / source_url（DTO 层 extra=forbid 拦截）\n"
+        "- 显式传 null 可清空字段（如清空 seniority）\n"
+        "- jd_text 从空 → 非空时不自动触发分析，需独立调用 POST /api/jobs/analyze\n"
+        "- 不存在返回 404"
+    ),
+)
+async def update_job(
+    job_id: uuid.UUID = Path(
+        ...,
+        description="岗位 UUID v4",
+    ),
+    body: JobUpdateRequest = None,  # type: ignore[assignment]
+    db: AsyncSession = Depends(get_db_session),
+) -> JobResponse:
+    """部分更新岗位端点
+
+    Args:
+        job_id: 岗位 UUID（Path 校验）
+        body: 部分更新请求（字段全可选，仅传入字段会被更新）
+        db: 请求级 AsyncSession
+
+    Returns:
+        JobResponse: 更新后的完整岗位信息
+
+    Raises:
+        ResourceNotFoundError: 岗位不存在（中间件转 404）
+        ValidationError: 字段校验失败（中间件转 422）
+    """
+    # 允许 PATCH 空请求体：FastAPI 默认对 body=None 报 422，
+    # 这里使用默认值 None + 手动构造空 DTO，兼容「PATCH 无 body」的合法场景
+    if body is None:
+        body = JobUpdateRequest()
+
+    logger.info(
+        "更新岗位端点 | job_id={} | fields={}",
+        job_id,
+        list(body.model_dump(exclude_unset=True).keys()),
+    )
+
+    service = JobService(db)
+    return await service.update_job(job_id, body)
 
 
 # ==================== 端点：分析岗位 ====================

@@ -124,6 +124,36 @@ async def _app_exception_handler(request: Request, exc: AppException) -> JSONRes
 
 # ==================== 参数校验异常 ====================
 
+def _sanitize_validation_errors(
+    errors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把 Pydantic 错误详情中的不可序列化对象（如异常实例）转为字符串
+
+    Pydantic v2 的 ctx 字段可能包含原始异常对象，JSONResponse 序列化时会失败。
+    这里递归处理 dict / list，保留结构的同时把异常对象转为 str。
+    """
+    sanitized: list[dict[str, Any]] = []
+    for error in errors:
+        sanitized.append(_make_json_safe(error))
+    return sanitized
+
+
+def _make_json_safe(obj: Any) -> Any:
+    """递归把不可 JSON 序列化的对象转换为字符串"""
+    if isinstance(obj, dict):
+        return {str(k): _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_make_json_safe(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_make_json_safe(item) for item in obj)
+    if isinstance(obj, BaseException):
+        return f"{type(obj).__name__}: {obj}"
+    # UUID / datetime 等也能被 JSONResponse 默认处理，但显式转字符串更安全
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    return obj
+
+
 async def _validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
@@ -145,8 +175,9 @@ async def _validation_exception_handler(
 
     debug_payload: dict[str, Any] | None = None
     if get_settings().app_env == "dev":
-        # 把 Pydantic 详细错误暴露给前端，方便联调
-        debug_payload = {"errors": errors}
+        # Pydantic 的 error ctx 里可能携带原始异常对象（如 ValueError），
+        # JSONResponse 序列化时会抛 TypeError，因此先把异常对象转为字符串
+        debug_payload = {"errors": _sanitize_validation_errors(errors)}
 
     return _build_error_response(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
