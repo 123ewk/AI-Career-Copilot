@@ -541,7 +541,9 @@ def _build_test_app(
     """
     app = FastAPI()
     add_exception_middleware(app)
-    app.include_router(auth_router)
+    # main.py 中 auth router 挂载在 /api/auth 前缀下，
+    # 测试 app 必须与生产路径保持一致，否则请求 /api/auth/register 会 404
+    app.include_router(auth_router, prefix="/api/auth")
 
     async def override_session() -> AsyncSession:
         yield mock_session

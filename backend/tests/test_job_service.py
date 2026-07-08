@@ -37,6 +37,7 @@ from app.domain.job.models import (
     JobAnalyzeResponse,
     JobListResponse,
     JobResponse,
+    JobUpdateRequest,
 )
 from app.domain.job.service import JobService
 from app.domain.task.dto import TaskDTO
@@ -152,6 +153,7 @@ def _make_job_orm(**overrides) -> MagicMock:
         "company": SAMPLE_COMPANY,
         "salary_min": 30,
         "salary_max": 50,
+        "salary_unit": "K",
         "jd_text": SAMPLE_JD_TEXT,
         "source": SAMPLE_SOURCE,
         "source_url": None,
@@ -304,6 +306,139 @@ class TestJobServiceGet:
 
         with pytest.raises(ResourceNotFoundError):
             await service.get_job(SAMPLE_JOB_ID)
+
+
+# ==================== Update Job（海投模式 PATCH 补充详情）====================
+
+
+class TestJobServiceUpdate:
+    """部分更新岗位测试
+
+    覆盖海投模式核心场景：
+    - 列表页创建空 jd_text 岗位后，用户点击卡片补充详情
+    - PATCH 语义：仅更新传入字段，未传入字段保持原值
+    - 显式传 null 清空字段
+    - 岗位不存在抛 ResourceNotFoundError
+    """
+
+    async def test_update_job_supplement_jd_text(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+        mock_session: AsyncMock,
+    ) -> None:
+        """海投模式：补充 jd_text（从空 → 完整 JD）"""
+        # 列表页创建时 jd_text 为空
+        empty_job = _make_job_orm(jd_text="")
+        mock_repo.get_by_id.return_value = empty_job
+
+        req = JobUpdateRequest(
+            jd_text="完整 JD：负责 Python 后端开发，要求熟悉 FastAPI...",
+            skills=["Python", "FastAPI", "PostgreSQL"],
+            location="深圳·南山区",
+        )
+
+        result = await service.update_job(SAMPLE_JOB_ID, req)
+
+        assert isinstance(result, JobResponse)
+        # 验证 setattr 被调用，字段已更新
+        assert empty_job.jd_text == req.jd_text
+        assert empty_job.skills == req.skills
+        assert empty_job.location == req.location
+        mock_session.commit.assert_called_once()
+        mock_session.refresh.assert_called_once_with(empty_job)
+
+    async def test_update_job_partial_fields_only(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """仅更新传入字段，未传入字段保持原值"""
+        original_jd = "原 JD 内容"
+        original_skills = ["Python"]
+        job = _make_job_orm(jd_text=original_jd, skills=original_skills)
+        mock_repo.get_by_id.return_value = job
+
+        # 只更新 location，不传 jd_text / skills
+        req = JobUpdateRequest(location="上海·浦东新区")
+
+        await service.update_job(SAMPLE_JOB_ID, req)
+
+        # 验证：location 被更新，jd_text 和 skills 保持原值
+        assert job.location == "上海·浦东新区"
+        assert job.jd_text == original_jd
+        assert job.skills == original_skills
+
+    async def test_update_job_not_found(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """岗位不存在抛 ResourceNotFoundError"""
+        mock_repo.get_by_id.return_value = None
+
+        req = JobUpdateRequest(jd_text="新 JD")
+
+        with pytest.raises(ResourceNotFoundError):
+            await service.update_job(SAMPLE_JOB_ID, req)
+
+    async def test_update_job_explicit_null_clears_field(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """显式传 null 清空字段（PATCH 语义）
+
+        场景：用户手动修正错误的 seniority，传 seniority=null 清空
+        """
+        job = _make_job_orm(seniority="senior")
+        mock_repo.get_by_id.return_value = job
+
+        # 显式传 null（不是省略）
+        req = JobUpdateRequest(seniority=None)
+
+        await service.update_job(SAMPLE_JOB_ID, req)
+
+        # 验证：seniority 被清空为 None
+        assert job.seniority is None
+
+    async def test_update_job_salary_unit(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+    ) -> None:
+        """更新 salary_unit（Boss 薪资单位：K / 元/天 / 元/时）"""
+        job = _make_job_orm(salary_unit=None)
+        mock_repo.get_by_id.return_value = job
+
+        req = JobUpdateRequest(salary_unit="元/天")
+
+        await service.update_job(SAMPLE_JOB_ID, req)
+
+        assert job.salary_unit == "元/天"
+
+    async def test_update_job_empty_request_no_changes(
+        self,
+        service: JobService,
+        mock_repo: AsyncMock,
+        mock_session: AsyncMock,
+    ) -> None:
+        """空请求体：不更新任何字段（合法场景）
+
+        场景：Extension 发送 PATCH 但 body 为空（例如详情面板尚未加载完）
+        """
+        job = _make_job_orm()
+        mock_repo.get_by_id.return_value = job
+        original_title = job.title
+
+        req = JobUpdateRequest()  # 全部使用默认值
+
+        await service.update_job(SAMPLE_JOB_ID, req)
+
+        # 验证：所有字段保持原值
+        assert job.title == original_title
+        # commit 仍应被调用（保持事务一致性）
+        mock_session.commit.assert_called_once()
 
 
 # ==================== List Jobs ====================

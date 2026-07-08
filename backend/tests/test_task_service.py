@@ -43,8 +43,15 @@ def mock_repo() -> AsyncMock:
 
 @pytest.fixture
 def service(mock_session: AsyncMock, mock_repo: AsyncMock) -> TaskService:
-    """TaskService 实例（通过构造函数注入 mock repo）"""
-    return TaskService(mock_session, repo=mock_repo)
+    """TaskService 实例（通过构造函数注入 mock repo）
+
+    自动 mock _ensure_session_exists：
+    - 单测聚焦 TaskService 自身逻辑，不测试 session 存在性检查
+    - 避免 AsyncMock 的 execute() 返回未 await 的 coroutine 触发 resource warning
+    """
+    svc = TaskService(mock_session, repo=mock_repo)
+    svc._ensure_session_exists = AsyncMock()
+    return svc
 
 
 # ==================== 测试数据 ====================
@@ -136,6 +143,7 @@ class TestTaskServiceCreate:
         mock_insert.return_value = _make_task()
         session = AsyncMock()
         svc = TaskService(session)
+        svc._ensure_session_exists = AsyncMock()
 
         await svc.create_task(
             user_id=SAMPLE_USER_ID,

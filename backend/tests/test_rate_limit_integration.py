@@ -31,6 +31,20 @@ def _setup_logging() -> None:
     setup_logging()
 
 
+@pytest.fixture(autouse=True)
+async def _reset_redis_factory() -> AsyncGenerator[None, None]:
+    """每个测试前重置 Redis 工厂，避免复用已关闭 event loop 上的连接池
+
+    redis_client_factory 是模块级单例，首次创建后绑定到当时的 event loop。
+    当 pytest-asyncio 为每个测试创建新 event loop 时，旧 pool 会抛出
+    RuntimeError: Event loop is closed。重置工厂可让测试使用当前 loop。
+    """
+    redis_client_factory._pool = None  # type: ignore[attr-defined]
+    redis_client_factory._client = None  # type: ignore[attr-defined]
+    yield
+    await redis_client_factory.close()
+
+
 @pytest.fixture
 def app() -> FastAPI:
     """构造测试应用

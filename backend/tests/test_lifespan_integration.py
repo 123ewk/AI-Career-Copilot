@@ -36,8 +36,14 @@ _ROUTER_MODULES = [
     "app.api.routers.task",
     "app.api.routers.agent",
     "app.api.routers.workflow",
+    "app.api.routers.applications",
+    "app.api.routers.communication",
 ]
+
+# 保存真实的 routers 模块，测试结束后恢复，避免污染后续测试的 import 状态
+_ORIGINAL_ROUTER_MODULES: dict[str, types.ModuleType | None] = {}
 for _name in _ROUTER_MODULES:
+    _ORIGINAL_ROUTER_MODULES[_name] = sys.modules.get(_name)
     if _name in sys.modules:
         del sys.modules[_name]
     _mod = types.ModuleType(_name)
@@ -48,14 +54,37 @@ for _name in _ROUTER_MODULES:
 import main as main_module  # noqa: E402
 from main import create_app, lifespan  # noqa: E402
 
+#  lifespan 测试只需要 main 模块内部持有 mock router 引用，
+#  但必须立即恢复 sys.modules 中的真实 routers 模块并移除 main 缓存，
+#  否则 pytest 收集后续测试模块（如 test_job_router）时，
+#  会拿到 mock routers，导致 patch("app.api.routers.jobs.JobService") 找不到属性。
+for _name, _original_mod in _ORIGINAL_ROUTER_MODULES.items():
+    if _original_mod is not None:
+        sys.modules[_name] = _original_mod
+    elif _name in sys.modules:
+        del sys.modules[_name]
+sys.modules.pop("main", None)
+
 
 @pytest.fixture(autouse=True)
 def _cleanup_router_mocks():
-    """测试结束后清理 routers mock，让其他测试可正常 import 真实 routers"""
+    """测试结束后恢复真实 routers 模块并清理 main 缓存
+
+    为什么必须恢复：
+    - lifespan 测试需要在 import main 前把 routers 替换为 mock
+    - 但本文件 import 的 main 模块会被缓存到 sys.modules
+    - 后续测试（如 test_job_router）再 import app.api.routers.jobs 时，
+      若 sys.modules 中仍是 mock 模块或已被删除，会导致 patch 目标属性缺失
+    - 恢复原始 routers 并删除 main 缓存，可让后续测试重新 import 真实依赖
+    """
     yield
-    for name in list(sys.modules):
-        if name.startswith("app.api.routers"):
+    for name, original_mod in _ORIGINAL_ROUTER_MODULES.items():
+        if original_mod is not None:
+            sys.modules[name] = original_mod
+        elif name in sys.modules:
             del sys.modules[name]
+    # main 模块在 import 时使用了 mock routers，删除缓存让后续测试重新加载真实 main
+    sys.modules.pop("main", None)
 
 
 # ==================== Mock 外部依赖 ====================
