@@ -39,6 +39,7 @@ class JobRepositoryProtocol(Protocol):
         source_url: str | None = None,
         salary_min: int | None = None,
         salary_max: int | None = None,
+        salary_unit: str | None = None,
         location: str | None = None,
         skills: list[str] | None = None,
         keywords: list[str] | None = None,
@@ -55,6 +56,7 @@ class JobRepositoryProtocol(Protocol):
             source_url: 原始链接（唯一约束，用于去重）
             salary_min: 最低薪资（K）
             salary_max: 最高薪资（K）
+            salary_unit: 薪资单位（K / 元/天 / 元/时，仅记录用）
             location: 工作地点
             skills: 技能列表
             keywords: 关键词列表

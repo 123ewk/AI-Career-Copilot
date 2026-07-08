@@ -40,6 +40,7 @@ from app.domain.job.models import (
     JobListResponse,
     JobResponse,
     JobSummary,
+    JobUpdateRequest,
 )
 from app.domain.repositories.job import JobRepositoryProtocol
 from app.domain.task.service import TaskService
@@ -107,6 +108,7 @@ class JobService:
         source_url: str | None = None,
         salary_min: int | None = None,
         salary_max: int | None = None,
+        salary_unit: str | None = None,
         location: str | None = None,
         skills: list[str] | None = None,
         keywords: list[str] | None = None,
@@ -122,11 +124,12 @@ class JobService:
         Args:
             title: 岗位名称
             company: 公司名称
-            jd_text: JD 原文
+            jd_text: JD 原文（海投模式可为空字符串）
             source: 来源平台
             source_url: 原始链接（唯一约束，用于去重）
             salary_min: 最低薪资（K）
             salary_max: 最高薪资（K）
+            salary_unit: 薪资单位（K / 元/天 / 元/时，仅记录用）
             location: 工作地点
             skills: 技能列表
             keywords: 关键词列表
@@ -153,6 +156,7 @@ class JobService:
             source_url=source_url,
             salary_min=salary_min,
             salary_max=salary_max,
+            salary_unit=salary_unit,
             location=location,
             skills=skills,
             keywords=keywords,
@@ -182,6 +186,63 @@ class JobService:
                 detail=f"岗位 {job_id} 不存在",
                 extra={"job_id": str(job_id)},
             )
+        return JobResponse.model_validate(job)
+
+    async def update_job(
+        self,
+        job_id: uuid.UUID,
+        req: JobUpdateRequest,
+    ) -> JobResponse:
+        """部分更新岗位（PATCH /api/jobs/{job_id}）
+
+        行为：
+        - 仅更新 req 中显式传入的字段（用 model_dump(exclude_unset=True) 区分「未传入」与「显式 null」）
+        - jd_text 从空 → 非空时不自动触发分析（由 Router / Extension 显式调用 analyze）
+        - 不允许更新 source / source_url（已在 DTO 层面通过 extra="forbid" + 字段集合限制）
+
+        设计：
+        - 直接 ORM 属性赋值：SQLAlchemy 自动检测 dirty，flush 时生成 UPDATE SQL
+        - 显式传入 null（如 seniority=None）会清空字段，符合 PATCH 语义
+        - 不在此处做用户隔离校验：Job 表当前无 user_id（MVP 技术债，Phase 2 评估）
+          · 若未来 Job 表增加 user_id 字段，应在此处校验 job.user_id == current_user.id
+
+        Args:
+            job_id: 岗位 UUID
+            req: 部分更新请求（仅传入字段会被更新）
+
+        Returns:
+            JobResponse DTO（更新后的完整岗位信息）
+
+        Raises:
+            ResourceNotFoundError: 岗位不存在
+        """
+        logger.info(
+            "更新岗位 | job_id={} | fields={}",
+            job_id,
+            list(req.model_dump(exclude_unset=True).keys()),
+        )
+
+        job = await self._repo.get_by_id(job_id)
+        if job is None:
+            raise ResourceNotFoundError(
+                detail=f"岗位 {job_id} 不存在",
+                extra={"job_id": str(job_id)},
+            )
+
+        # 仅更新显式传入的字段
+        # exclude_unset=True：区分「未传入」（默认值）与「显式传 null」
+        update_data = req.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(job, field, value)
+
+        await self._session.commit()
+        await self._session.refresh(job)
+
+        logger.info(
+            "岗位更新成功 | job_id={} | updated_fields={}",
+            job_id,
+            list(update_data.keys()),
+        )
         return JobResponse.model_validate(job)
 
     async def list_jobs(
@@ -362,8 +423,11 @@ class JobService:
                 )
 
         # 6. 同步降级路径：直接执行 Agent，保存结果并标记任务完成
+        # 先标记 RUNNING：同步降级仍然是一次完整的任务执行，必须遵守状态机
+        # PENDING → RUNNING → COMPLETED，避免 mark_completed 时状态机校验失败
         logger.warning("岗位分析同步降级执行 | job_id={} | task_id={}", job_id, task.id)
         try:
+            await self._task_service.mark_running(task.id)
             analysis = await self.run_analysis(
                 job_id, job.jd_text, company=job.company
             )
@@ -385,7 +449,7 @@ class JobService:
 
         await self._task_service.mark_completed(
             task.id,
-            result=analysis.model_dump(),
+            result=analysis.model_dump(mode="json"),
         )
         return JobAnalyzeResponse(
             job_id=job_id,

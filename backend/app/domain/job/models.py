@@ -331,7 +331,7 @@ class JobCreateRequest(BaseModel):
     字段：
     - title: 岗位名称（必填，1-300 字符）
     - company: 公司名称（必填，1-300 字符）
-    - jd_text: JD 原文（必填，1-50000 字符）
+    - jd_text: JD 原文（可选，0-50000 字符；海投模式列表页提取时可空，后续通过 PATCH 补充）
     - source: 来源平台（必填，枚举：boss/liepin/zhilian/shixiseng）
     - source_url: 原始链接（可选，最大 1000 字符，ORM 唯一索引去重）
     - salary_min / salary_max: 薪资范围（可选，单位 K）
@@ -342,13 +342,16 @@ class JobCreateRequest(BaseModel):
     设计：
     - skills/keywords/seniority/difficulty 全部可选：用户手动录入岗位时可填，
       Extension 自动化场景可全空（由 Agent 分析后回填）
+    - jd_text 允许为空字符串：海投模式从列表页批量提取时无完整 JD，
+      先用基础信息创建 Job，后续通过 PATCH /api/jobs/{id} 补充详情
     - source_url 唯一性：依赖 ORM 唯一索引去重，DTO 不做查重（避免双层防御）
     - salary_min <= salary_max：model_validator 校验
 
     业务流：
-    1. Extension 抓取 → POST /api/jobs 创建（含 jd_text）
-    2. POST /api/jobs/{id}/analyze 触发 Agent 分析
-    3. Agent 完成后落库 + 写缓存
+    1. Extension 海投模式从列表页批量提取 → POST /api/jobs 创建（jd_text 可为空）
+    2. 用户点击卡片 → 详情面板加载完整 JD → PATCH /api/jobs/{id} 补充 jd_text
+    3. POST /api/jobs/analyze 触发 Agent 分析（要求 jd_text 已补充）
+    4. Agent 完成后落库 + 写缓存
     """
 
     model_config = ConfigDict(
@@ -371,10 +374,10 @@ class JobCreateRequest(BaseModel):
         examples=["某互联网公司"],
     )
     jd_text: str = Field(
-        ...,
-        min_length=1,
+        default="",
+        min_length=0,
         max_length=JOB_JD_TEXT_MAX_LENGTH,
-        description="JD 原文",
+        description="JD 原文（海投模式列表页提取时可空）",
     )
     source: str = Field(
         ...,
@@ -397,6 +400,11 @@ class JobCreateRequest(BaseModel):
         ge=JOB_SALARY_MIN_K,
         le=JOB_SALARY_MAX_K,
         description="最高薪资（K）",
+    )
+    salary_unit: str | None = Field(
+        default=None,
+        max_length=50,
+        description="薪资单位（K / 元/天 / 元/时，仅记录用）",
     )
     location: str | None = Field(
         default=None,
@@ -682,11 +690,15 @@ class JobResponse(BaseModel):
         default=None,
         description="最高薪资（K）",
     )
+    salary_unit: str | None = Field(
+        default=None,
+        description="薪资单位（K / 元/天 / 元/时）",
+    )
     jd_text: str = Field(
-        ...,
-        min_length=1,
+        default="",
+        min_length=0,
         max_length=JOB_JD_TEXT_MAX_LENGTH,
-        description="JD 原文",
+        description="JD 原文（海投模式列表页提取时可空）",
     )
     source: str = Field(
         ...,
@@ -720,12 +732,150 @@ class JobResponse(BaseModel):
     )
     analysis: JobAnalysisResult | None = Field(
         default=None,
+        validation_alias="analysis_result",
         description="JD 分析结果（None 表示未分析）",
     )
     created_at: datetime = Field(
         ...,
         description="创建时间（ISO 8601）",
     )
+
+
+class JobUpdateRequest(BaseModel):
+    """岗位部分更新请求（PATCH /api/jobs/{job_id}）
+
+    字段：
+    - 所有字段全部可选：仅更新传入字段，未传入字段保持原值
+    - jd_text: 海投模式补充 JD 时使用（从空 → 完整 JD）
+    - skills / keywords: 列表整体替换（不增量合并）
+    - seniority / difficulty: Agent 补全或人工修正
+
+    设计：
+    - 字段全部 Optional + default=None：用 model_dump(exclude_unset=True) 区分「未传入」与「显式传 null」
+      · 未传入：不更新（保持原值）
+      · 显式传 null：清空字段（如清空 seniority）
+    - extra="forbid"：禁止传入 DTO 未定义字段，避免越权更新 analysis_result 等内部字段
+    - 复用 JobCreateRequest 的枚举校验规则：source 不在更新范围内（不可改来源平台）
+    - 不允许更新 source_url：唯一约束字段，更新可能引发冲突；如需改请走删除重建流程
+
+    业务流：
+    - Extension 海投模式：用户点击卡片 → 详情面板加载完整 JD → PATCH /api/jobs/{id} 补充
+    - 后续可由 Agent 补充 skills/keywords/seniority/difficulty
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    jd_text: str | None = Field(
+        default=None,
+        min_length=0,
+        max_length=JOB_JD_TEXT_MAX_LENGTH,
+        description="JD 原文（可选，海投模式补充详情时传入）",
+    )
+    skills: list[str] | None = Field(
+        default=None,
+        max_length=JOB_SKILLS_MAX_LENGTH,
+        description="技能列表（整体替换，不增量合并）",
+    )
+    keywords: list[str] | None = Field(
+        default=None,
+        max_length=JOB_KEYWORDS_MAX_LENGTH,
+        description="关键词列表（整体替换）",
+    )
+    location: str | None = Field(
+        default=None,
+        max_length=JOB_LOCATION_MAX_LENGTH,
+        description="工作地点",
+    )
+    salary_min: int | None = Field(
+        default=None,
+        ge=JOB_SALARY_MIN_K,
+        le=JOB_SALARY_MAX_K,
+        description="最低薪资（K）",
+    )
+    salary_max: int | None = Field(
+        default=None,
+        ge=JOB_SALARY_MIN_K,
+        le=JOB_SALARY_MAX_K,
+        description="最高薪资（K）",
+    )
+    salary_unit: str | None = Field(
+        default=None,
+        max_length=50,
+        description="薪资单位（K / 元/天 / 元/时，仅记录用，不参与计算）",
+    )
+    seniority: str | None = Field(
+        default=None,
+        description="资历要求（intern/entry/junior/mid/senior/lead/principal）",
+    )
+    difficulty: str | None = Field(
+        default=None,
+        description="难度评级（easy/medium/hard/expert）",
+    )
+
+    @field_validator("seniority")
+    @classmethod
+    def _check_seniority(cls, value: str | None) -> str | None:
+        """seniority 枚举校验（与 JobCreateRequest 一致）"""
+        if value is not None and value not in _SENIORITY_VALUES:
+            raise ValueError(
+                f"seniority 必须是 {sorted(_SENIORITY_VALUES)} 之一"
+            )
+        return value
+
+    @field_validator("difficulty")
+    @classmethod
+    def _check_difficulty(cls, value: str | None) -> str | None:
+        """difficulty 枚举校验（与 JobCreateRequest 一致）"""
+        if value is not None and value not in _DIFFICULTY_VALUES:
+            raise ValueError(
+                f"difficulty 必须是 {sorted(_DIFFICULTY_VALUES)} 之一"
+            )
+        return value
+
+    @field_validator("skills")
+    @classmethod
+    def _check_skills_items(cls, value: list[str] | None) -> list[str] | None:
+        """skills 元素长度校验"""
+        if value is None:
+            return value
+        for item in value:
+            if len(item) > JOB_SKILL_ITEM_MAX_LENGTH:
+                raise ValueError(
+                    f"skill 单个标签长度不能超过 {JOB_SKILL_ITEM_MAX_LENGTH} 字符"
+                )
+        return value
+
+    @field_validator("keywords")
+    @classmethod
+    def _check_keywords_items(cls, value: list[str] | None) -> list[str] | None:
+        """keywords 元素长度校验"""
+        if value is None:
+            return value
+        for item in value:
+            if len(item) > JOB_KEYWORD_ITEM_MAX_LENGTH:
+                raise ValueError(
+                    f"keyword 单个标签长度不能超过 {JOB_KEYWORD_ITEM_MAX_LENGTH} 字符"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _check_salary_range(self) -> "JobUpdateRequest":
+        """校验 salary_min <= salary_max（仅当两者都传入时）
+
+        允许「只传一个」：用户可能只更新薪资下限，另一个保持原值
+        """
+        if (
+            self.salary_min is not None
+            and self.salary_max is not None
+            and self.salary_min > self.salary_max
+        ):
+            raise ValueError(
+                f"薪资下限 {self.salary_min} 不能大于上限 {self.salary_max}"
+            )
+        return self
 
 
 class JobAnalyzeResponse(BaseModel):

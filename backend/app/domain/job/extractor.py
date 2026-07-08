@@ -40,7 +40,7 @@ from app.domain.job.models import (
     JOB_JD_TEXT_MAX_LENGTH,
     JobAnalysisResult,
 )
-from app.integrations.llm.mimo_client import MimoClient
+from app.integrations.llm.llm_client import LLMClient
 
 # ==================== 内部常量 ====================
 
@@ -97,16 +97,16 @@ class JobExtractor:
         print(result.skills)
         print(result.difficulty)
 
-    设计为可复用实例:提取器内部使用 MimoClient，可复用。
+    设计为可复用实例:提取器内部使用 LLMClient，可复用。
     """
 
-    def __init__(self, llm_client: MimoClient | None = None) -> None:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
         """初始化提取器
 
         Args:
-            llm_client: Mimo 客户端实例。None 时自动创建。
+            llm_client: LLM 客户端实例。None 时自动创建。
         """
-        self._llm = llm_client or MimoClient()
+        self._llm = llm_client or LLMClient()
         logger.info("JobExtractor 初始化完成")
 
     async def extract(self, jd_text: str) -> JobAnalysisResult:
@@ -189,7 +189,7 @@ class JobExtractor:
         if not choices:
             logger.error("LLM 响应格式错误：choices 为空")
             raise ExternalServiceError(
-                detail="Mimo API 响应格式错误：choices 为空",
+                detail="LLM 响应格式错误：choices 为空",
                 error_code="EXT_007",
                 extra={"response": str(response)[:500]},
             )
@@ -198,7 +198,7 @@ class JobExtractor:
         if not content:
             logger.error("LLM 响应格式错误：content 为空")
             raise ExternalServiceError(
-                detail="Mimo API 响应格式错误：content 为空",
+                detail="LLM 响应格式错误：content 为空",
                 error_code="EXT_008",
                 extra={"response": str(response)[:500]},
             )
@@ -213,7 +213,7 @@ class JobExtractor:
                 str(exc),
             )
             raise ExternalServiceError(
-                detail="Mimo API 响应 JSON 解析失败",
+                detail="LLM 响应 JSON 解析失败",
                 error_code="EXT_009",
                 extra={"content": content[:500], "error": str(exc)},
             ) from exc
@@ -230,7 +230,7 @@ class JobExtractor:
                 str(exc),
             )
             raise ExternalServiceError(
-                detail="Mimo API 响应格式校验失败",
+                detail="LLM 响应格式校验失败",
                 error_code="EXT_010",
                 extra={"data": str(data)[:500], "error": str(exc)},
             ) from exc
