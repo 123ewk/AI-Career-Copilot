@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import select
+
 from app.core.exceptions import (
     ConflictError,
     DuplicateMessageError,
@@ -41,6 +43,7 @@ from app.core.logger import logger
 from app.domain.common.idempotent import insert_idempotent
 from app.domain.repositories.task import TaskRepositoryProtocol
 from app.domain.task.dto import TaskDTO, TaskListResponse
+from app.infra.database.models.session import Session, SessionStatus
 from app.infra.database.models.task import Task, TaskStatus
 
 # 合法状态转换图：键为当前状态，值为允许的目标状态
@@ -55,16 +58,25 @@ _VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
 }
 
 
-def _validate_status_transition(current: TaskStatus, target: TaskStatus) -> None:
+def _validate_status_transition(current: TaskStatus | str, target: TaskStatus | str) -> None:
     """校验任务状态转换是否合法
 
+    为什么接受 str：
+    - SQLAlchemy 从 PostgreSQL ENUM 读取时，偶发返回原始字符串而非 Python Enum
+    - 统一在入口处归一化为 TaskStatus，避免下游访问 .value 时 AttributeError
+
     Args:
-        current: 当前状态
-        target: 目标状态
+        current: 当前状态（枚举或字符串）
+        target: 目标状态（枚举或字符串）
 
     Raises:
         TaskStateError: 非法转换
     """
+    if isinstance(current, str):
+        current = TaskStatus(current)
+    if isinstance(target, str):
+        target = TaskStatus(target)
+
     if target not in _VALID_TRANSITIONS.get(current, set()):
         raise TaskStateError(
             detail=f"任务状态转换非法：{current.value} → {target.value}",
@@ -112,6 +124,39 @@ class TaskService:
             repo = TaskRepository(session)
         self._repo: TaskRepositoryProtocol = repo
 
+    async def _ensure_session_exists(
+        self,
+        *,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+    ) -> None:
+        """确保任务关联的 session 存在
+
+        为什么放在 TaskService：
+        - tasks 表对 sessions.id 有外键约束，创建任务前必须保证 session 存在
+        - MVP 阶段会话管理 API 尚未实现，调用方可能直接传入新生成的 UUID
+        - 自动创建 session 是任务创建的前置条件，放在此处最内聚
+
+        行为：
+        - 若 session 已存在，不做任何操作
+        - 若不存在，插入 ACTIVE 状态的 session 记录
+        """
+        result = await self._session.execute(
+            select(Session.id).where(Session.id == session_id)
+        )
+        if result.scalar_one_or_none() is not None:
+            return
+
+        self._session.add(
+            Session(
+                id=session_id,
+                user_id=user_id,
+                status=SessionStatus.ACTIVE,
+            )
+        )
+        await self._session.flush()
+        logger.info("自动创建 session | session_id={} | user_id={}", session_id, user_id)
+
     async def create_task(
         self,
         *,
@@ -146,6 +191,11 @@ class TaskService:
             task_type,
             business_id,
         )
+
+        # 确保 session 存在：任务表对 sessions.id 有外键约束，
+        # MVP 阶段会话路由仍为占位实现，调用方可能直接传入新生成的 session_id。
+        # 若 session 不存在则自动创建，避免 FK 冲突被 insert_idempotent 误报为"任务已存在"。
+        await self._ensure_session_exists(session_id=session_id, user_id=user_id)
 
         try:
             task: Task = await insert_idempotent(
