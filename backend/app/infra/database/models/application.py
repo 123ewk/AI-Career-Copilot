@@ -157,6 +157,15 @@ class Application(Base):
         comment="投递时间",
     )
 
+    # 创建时间：记录首次创建时间，与 status_updated_at 分离
+    # status_updated_at 每次状态变更都更新，created_at 保持不变
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+        comment="创建时间",
+    )
+
     # 状态更新时间：每次状态变更时由 Service 层更新
     # 与 created_at 分离：created_at 是记录创建时间，status_updated_at 是状态变更时间
     # 用途：计算某状态停留时长，驱动 Agent 超时提醒（如 HR 7 天未查看则提醒）

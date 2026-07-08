@@ -89,6 +89,15 @@ class Job(Base):
         comment="最高薪资（K）",
     )
 
+    # 薪资单位：Boss 直聘薪资可能是 K/月、元/天、元/时
+    # 仅作记录用，不参与数值计算；Extension 抓取时保留原始单位信息
+    # 允许 NULL：部分岗位未标注薪资
+    salary_unit: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="薪资单位（K / 元/天 / 元/时，仅记录用）",
+    )
+
     # JD 原文：Text 类型无长度限制，存储完整岗位描述
     jd_text: Mapped[str] = mapped_column(
         Text,
