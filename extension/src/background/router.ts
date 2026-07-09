@@ -692,6 +692,51 @@ async function handleRefreshJobs(
   })
 }
 
+/**
+ * LOAD_JOB_DETAIL handler
+ *
+ * SidePanel 选中岗位后，请求 Content Script 在 Boss 页面点击对应卡片，
+ * 从而展开 Boss 详情面板并触发 JD 提取。
+ *
+ * 流程：
+ * 1. 查询当前激活 Tab
+ * 2. 校验当前页是否为 Boss 列表页
+ * 3. 向该 Tab 的 Content Script 发送 LOAD_JOB_DETAIL 消息
+ * 4. 把 Content Script 的响应原样返回给 SidePanel
+ */
+async function handleLoadJobDetail(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.LOAD_JOB_DETAIL],
+): Promise<ChromeMessageResponse> {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id) {
+        resolve({ ok: false, error: '未找到当前激活的 Tab' })
+        return
+      }
+
+      console.log(
+        '[SW] LOAD_JOB_DETAIL | tabId=',
+        tab.id,
+        '| sourceUrl=',
+        payload.sourceUrl,
+      )
+
+      if (!isBossListPage(tab.url)) {
+        resolve({
+          ok: false,
+          error: '当前页面不是 Boss 职位列表页，无法加载详情',
+        })
+        return
+      }
+
+      void sendMessageToTab(tab.id, ChromeMessageType.LOAD_JOB_DETAIL, {
+        sourceUrl: payload.sourceUrl,
+      }).then(resolve)
+    })
+  })
+}
+
 // ==================== 路由初始化 ====================
 
 /**
@@ -721,6 +766,7 @@ export function initMessageRouter(): () => void {
     handleRecordApplication,
   )
   registerHandler(ChromeMessageType.REFRESH_JOBS, handleRefreshJobs)
+  registerHandler(ChromeMessageType.LOAD_JOB_DETAIL, handleLoadJobDetail)
 
   // 注册 chrome.runtime.onMessage 监听
   const listener = (

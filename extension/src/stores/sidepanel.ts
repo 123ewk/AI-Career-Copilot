@@ -498,8 +498,22 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
   /** chrome.storage.local 中用于持久化 SidePanel 状态的 key */
   const STORAGE_KEY = 'sidepanel_state'
 
+  /**
+   * 持久化状态版本号
+   *
+   * 用途：当数据 schema 或提取方案升级时（如 DOM 抓取 → API 拦截），
+   * 旧版本持久化的数据可能包含乱码/过期字段，通过版本号校验可强制丢弃旧数据，
+   * 避免 SidePanel 重新打开时展示错误内容。
+   *
+   * v2 → v3:移除 DOM 列表 fallback,改为纯 API 拦截。v2 持久化的 salaryRaw
+   * 可能为字体反爬乱码,强制丢弃。
+   */
+  const STORAGE_VERSION = 3
+
   /** 需要持久化的状态快照 */
   interface PersistedState {
+    /** 数据版本号，用于恢复时校验 */
+    version: number
     jobs: DisplayJob[]
     selectedSourceUrl: string | null
     taskResults: Record<string, JobTaskResults>
@@ -519,6 +533,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
       return
     }
     const state: PersistedState = {
+      version: STORAGE_VERSION,
       jobs: jobs.value,
       selectedSourceUrl: selectedSourceUrl.value,
       taskResults: taskResults.value,
@@ -556,6 +571,17 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
         chrome.storage.local.get([STORAGE_KEY], (result) => {
           const state = result[STORAGE_KEY] as PersistedState | undefined
           if (!state) {
+            resolve()
+            return
+          }
+
+          // 版本号校验：旧版本（如 DOM 抓取时代）持久化的数据可能包含乱码/过期字段，
+          // 直接丢弃，避免 SidePanel 展示错误内容。
+          if (state.version !== STORAGE_VERSION) {
+            console.warn(
+              `[store] 持久化数据版本不匹配 | stored=${state.version ?? 'none'} | current=${STORAGE_VERSION}，清空旧数据`,
+            )
+            void clearStorage()
             resolve()
             return
           }

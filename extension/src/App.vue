@@ -341,7 +341,7 @@ async function handleRefresh() {
       <div v-else class="detail-empty">
         <div class="empty-icon">👈</div>
         <p class="empty-title">选择左侧岗位查看详情</p>
-        <p class="empty-desc">点击岗位卡片即可补充 JD 并触发 AI 分析</p>
+        <p class="empty-desc">选中后点击「加载 Boss 详情并分析」即可触发 AI 分析</p>
       </div>
     </div>
 
