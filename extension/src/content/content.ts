@@ -248,15 +248,32 @@ if (pageInfo.isListPage) {
  * 列表页初始化逻辑
  *
  * 职责：
- * 1. 监听详情面板变化，补充 JD / 技能
- * 2. 监听 URL 变化，切换搜索条件时重置去重器
+ * 1. 监听列表 DOM 变化（滚动加载追加新卡片），作为 API 拦截器的补充数据源
+ * 2. 监听详情面板变化，补充 JD / 技能
+ * 3. 监听 URL 变化，切换搜索条件时重置去重器
  *
- * 注意：列表岗位数据由 SW 注册的 main-world 拦截器捕获 API 响应后
- * 通过 postMessage 传回（见上方 message listener），不再走 DOM 提取。
- * DOM 提取的薪资受字体反爬影响为乱码，已废弃。
+ * 数据源优先级（通过 sentJobTracker 按 detailUrl 去重自动协调）：
+ * - API 拦截器（主路径）：捕获 Boss 的 /wapi/zpgeek/.../job/list.json 响应
+ * - DOM observer（补充）：监听 .rec-job-list 子节点变化，提取新卡片
+ *
+ * 不会有首屏乱码问题的原因：
+ * - 首屏数据由 API 拦截器提供（registerContentScripts 在 document_start 注入）
+ * - DOM observer 在滚动加载时触发，此时自定义字体已加载，innerText 返回正常字符
+ * - sentJobTracker 确保不重复发送（API 已捕获的岗位 DOM 会跳过）
  */
 function initListPage(): void {
   bossAdapter.observe({
+    onJobsExtracted: (jobs) => {
+      // DOM observer 作为 API 拦截器的补充：
+      // sentJobTracker 按 detailUrl 去重，API 已捕获的会被跳过
+      const newJobs = sentJobTracker.filterNewJobs(jobs)
+      if (newJobs.length > 0) {
+        console.log(
+          `[AI Career Copilot] DOM observer: ${newJobs.length} new jobs (scroll/append)`,
+        )
+        void sendJobsExtracted(window.location.href, newJobs)
+      }
+    },
     onDetailExtracted: (detail) => {
       void sendDetailExtracted(detail)
     },
