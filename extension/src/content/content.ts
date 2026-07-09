@@ -2,26 +2,33 @@
  * Content Script 入口
  *
  * 职责：
- * - 尽早注入主世界拦截器，捕获 Boss 直聘职位列表 API 响应
- * - 接收拦截数据并解析为 RawBossJob，通过现有消息链路发送
- * - 保留 DOM 提取作为降级方案（API 未覆盖或页面结构特殊时）
+ * - 兜底注入主世界拦截器（主路径为 SW 的 registerContentScripts）
+ * - 接收主世界拦截器通过 postMessage 发送的 API 响应数据
+ * - 解析数据为 RawBossJob，通过现有消息链路发送给 Service Worker
  * - 监听详情面板变化，补充 JD / 技能等信息
  * - 监听卡片点击，记录选中岗位的 detailUrl
  * - 监听 SPA URL 变化，切换搜索条件时重置状态
  *
  * 消息流向：
- *   Content Script → chrome.runtime.sendMessage → Service Worker → 后端
+ *   主世界 interceptor.js → window.postMessage → Content Script → chrome.runtime.sendMessage → Service Worker → 后端
+ *
+ * 拦截器注入策略（双路径）：
+ * - 主路径：SW 通过 chrome.scripting.registerContentScripts 注册
+ *   world: 'MAIN' + runAt: 'document_start'（无竞态,早于页面 JS）
+ * - 兜底路径：Content Script 通过 <script> 标签注入
+ *   （有竞态,但确保主路径失败时数据链路不断）
+ * - interceptor.js 的 __bossJobInterceptorInstalled 标志防重复安装
  *
  * 设计动机：
- * - spec §3.1-3.4 要求 content.ts 负责 detect + observe + 消息发送
- * - adapter.ts 封装 DOM 提取和 MutationObserver，作为 API 方案的 fallback
+ * - adapter.ts 仅保留详情面板 DOM 监听和 URL 轮询,不再作为列表数据 fallback
+ *   (DOM 提取的薪资受字体反爬影响为乱码,已废弃)
  * - api_parser.ts 将 Boss 内部 API 响应转换为现有 RawBossJob 格式
  * - 不直接调用 chrome.storage / fetch（在 Content Script 中受限，由 SW 代理）
  *
  * 运行环境：
  * - Content Script 隔离世界，可访问 document/window，但不能访问页面 JS 变量
  * - 可用 chrome.runtime.sendMessage 与 Service Worker 通信
- * - run_at: document_start（尽早安装拦截器，抢在 Boss 页面请求之前）
+ * - run_at: document_start
  */
 
 import { bossAdapter } from '../modules/boss/adapter'
@@ -38,16 +45,20 @@ import {
   type CapturedApiPayload,
 } from '../modules/boss/api_parser'
 
-// ==================== 主世界拦截器注入 ====================
+// ==================== 主世界拦截器注入（兜底） ====================
 
 /**
- * 向页面主世界注入 API 拦截器脚本
+ * 向页面主世界注入 API 拦截器脚本（兜底路径）
  *
- * Content Script 处于 isolated world，无法直接拦截页面主世界的 fetch。
- * 通过动态创建 <script> 标签加载 extension/public/interceptor.js，
- * 该脚本在 main world 中 monkey-patch fetch/XHR，并通过 postMessage 回传数据。
+ * 主路径：SW 通过 chrome.scripting.registerContentScripts 在 document_start
+ * 注入 world: 'MAIN' 的 interceptor.js（无竞态，早于页面 JS）。
  *
- * manifest.json 已将 interceptor.js 声明为 web_accessible_resources。
+ * 兜底路径：如果 SW 注册失败（onInstalled 未触发、Chrome 版本不支持
+ * world: 'MAIN' 等），Content Script 通过 <script> 标签注入，确保拦截器
+ * 至少能装上（有 race condition，但数据链路不断）。
+ *
+ * interceptor.js 的 __bossJobInterceptorInstalled 标志防止重复安装，
+ * 两条路径安全共存。
  */
 function injectBossApiInterceptor(): void {
   if (document.querySelector('script[data-boss-interceptor]')) {
@@ -69,7 +80,8 @@ injectBossApiInterceptor()
 /**
  * 已发送岗位去重器
  *
- * API 拦截和 DOM 提取可能拿到同一批岗位，通过 detailUrl 去重避免 SidePanel 重复渲染。
+ * API 拦截器可能对同一接口的多次响应(滚动加载、分页)返回重复岗位,
+ * 通过 detailUrl 去重避免 SidePanel 重复渲染。
  * URL 变化（切换搜索条件/分页）时清空，避免旧数据影响新列表。
  */
 class SentJobTracker {
@@ -235,29 +247,16 @@ if (pageInfo.isListPage) {
 /**
  * 列表页初始化逻辑
  *
- * 1. 启动 DOM observer 作为 fallback（API 未命中时兜底）
- * 2. 监听详情面板变化，补充 JD / 技能
- * 3. 监听 URL 变化，切换搜索条件时重置去重器
+ * 职责：
+ * 1. 监听详情面板变化，补充 JD / 技能
+ * 2. 监听 URL 变化，切换搜索条件时重置去重器
+ *
+ * 注意：列表岗位数据由 SW 注册的 main-world 拦截器捕获 API 响应后
+ * 通过 postMessage 传回（见上方 message listener），不再走 DOM 提取。
+ * DOM 提取的薪资受字体反爬影响为乱码，已废弃。
  */
 function initListPage(): void {
-  // DOM fallback：如果 API 拦截没有命中，DOM 提取仍尝试补数据
-  // 通过 sentJobTracker 去重，避免与 API 数据重复发送
-  const domJobs = bossAdapter.extractJobs()
-  if (domJobs.length > 0) {
-    const newJobs = sentJobTracker.filterNewJobs(domJobs)
-    if (newJobs.length > 0) {
-      void sendJobsExtracted(pageInfo.url, newJobs)
-    }
-  }
-
-  // 启动监听
   bossAdapter.observe({
-    onJobsExtracted: (jobs) => {
-      const newJobs = sentJobTracker.filterNewJobs(jobs)
-      if (newJobs.length > 0) {
-        void sendJobsExtracted(window.location.href, newJobs)
-      }
-    },
     onDetailExtracted: (detail) => {
       void sendDetailExtracted(detail)
     },
@@ -266,8 +265,7 @@ function initListPage(): void {
         url,
         isBossListPage: isListPage,
       })
-      // 切换搜索条件/分页时清空去重器并重新挂载 DOM observer
-      // Boss SPA 会复用或重建 DOM，observer 需要重新绑定到新的容器上
+      // 切换搜索条件/分页时清空去重器并重新挂载 observer
       if (isListPage && url !== currentListPageUrl) {
         currentListPageUrl = url
         bossAdapter.disconnect()
@@ -327,24 +325,66 @@ async function sendDetailExtracted(
 // ==================== 监听 Service Worker 消息 ====================
 
 /**
+ * 在 Boss 列表页查找并点击对应岗位卡片
+ *
+ * 通过 sourceUrl（岗位详情页 URL）匹配 .job-card-box 内的 .job-name href，
+ * 找到后滚动到可视区域并模拟点击，触发 Boss 详情面板加载。
+ *
+ * @param sourceUrl 岗位详情页 URL
+ * @returns 是否找到并点击成功
+ */
+function clickBossJobCard(sourceUrl: string): { ok: boolean; error?: string } {
+  if (!sourceUrl) {
+    return { ok: false, error: 'sourceUrl 为空' }
+  }
+
+  const info = bossAdapter.detect()
+  if (!info.isListPage) {
+    return { ok: false, error: '当前页面不是 Boss 列表页' }
+  }
+
+  const cards = document.querySelectorAll(BOSS_SELECTORS.list.jobCard)
+  for (const card of cards) {
+    const href = queryAttribute(card, BOSS_SELECTORS.list.detailLink, 'href')
+    if (!href) continue
+
+    const absoluteHref = new URL(href, window.location.href).href
+    if (absoluteHref === sourceUrl) {
+      // 先滚动到可视区域，再点击，避免虚拟列表中卡片不可点击
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      // 稍微延迟点击，让滚动动画先开始，Boss 页面事件绑定有足够时间响应
+      setTimeout(() => {
+        ;(card as HTMLElement).click()
+      }, 150)
+      return { ok: true }
+    }
+  }
+
+  return { ok: false, error: '未找到对应岗位卡片，请检查列表是否已加载或已滚动到该岗位' }
+}
+
+/**
  * 监听 Service Worker 转发的消息
  *
  * 当前处理：
- * - REFRESH_JOBS：SidePanel 手动刷新，立即重新提取当前页面岗位
+ * - REFRESH_JOBS：SidePanel 手动刷新（API 拦截模式下数据被动捕获,此 handler 仅返回 ok）
+ * - LOAD_JOB_DETAIL：SidePanel 请求点击 Boss 页面对应岗位卡片，加载详情面板
  */
 onMessage((message) => {
   switch (message.type) {
     case ChromeMessageType.REFRESH_JOBS: {
-      const info = bossAdapter.detect()
-      if (info.isListPage) {
-        // 优先尝试 DOM 提取；若 API 拦截持续工作，refresh 时新数据会通过 postMessage 进入
-        const jobs = bossAdapter.extractJobs()
-        const newJobs = sentJobTracker.filterNewJobs(jobs)
-        if (newJobs.length > 0) {
-          void sendJobsExtracted(window.location.href, newJobs)
-        }
-      }
+      // API 拦截模式下数据被动捕获,手动刷新无需主动提取。
+      // 用户滚动列表或 Boss 页面自己发起 API 请求时,拦截器会自动命中。
       return { ok: true }
+    }
+    case ChromeMessageType.LOAD_JOB_DETAIL: {
+      const payload = message.payload as {
+        sourceUrl: string
+      }
+      // 点击前先记录选中 URL，确保详情面板加载后能正确关联
+      currentSelectedDetailUrl = payload.sourceUrl
+      const result = clickBossJobCard(payload.sourceUrl)
+      return result
     }
     default:
       return { ok: true }

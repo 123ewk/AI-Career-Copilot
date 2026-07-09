@@ -79,6 +79,14 @@ export const ChromeMessageType = {
    * 用于手动刷新按钮：用户滚动加载新岗位或切换筛选后，主动触发一次提取
    */
   REFRESH_JOBS: "REFRESH_JOBS",
+
+  /**
+   * SidePanel 请求 Content Script 在 Boss 页面点击对应岗位卡片
+   *
+   * 用于解决：用户在 SidePanel 点击卡片后，Boss 页面详情面板未自动展开，
+   * 导致 JD 无法补充、AI 分析无法触发的问题。
+   */
+  LOAD_JOB_DETAIL: "LOAD_JOB_DETAIL",
 } as const
 
 /** 消息类型字面量联合（用于泛型约束） */
@@ -225,6 +233,11 @@ export interface ChromeMessagePayloadMap {
   [ChromeMessageType.REFRESH_JOBS]: {
     /** 可选：指定要刷新的页面 URL；为空时使用当前页面 */
     pageUrl?: string
+  }
+
+  [ChromeMessageType.LOAD_JOB_DETAIL]: {
+    /** 岗位详情页 URL（DisplayJob.sourceUrl），用于在 Boss 列表页定位对应卡片 */
+    sourceUrl: string
   }
 
   [ChromeMessageType.PAGE_CHANGED]: {
