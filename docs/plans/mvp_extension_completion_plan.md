@@ -210,7 +210,7 @@ dist/assets/content.ts-BfMsJyWr.js           8.10 kB
 | TC-01 | 打开 Chrome SidePanel，输入账号密码登录 Extension | 登录成功，Header 显示用户昵称/邮箱 | [ ] |
 | TC-02 | 访问 Boss 直聘职位搜索列表页 `zhipin.com/web/geek/jobs` | SidePanel 自动进入「提取中」，通过拦截 Boss 内部 API 在 3 秒内显示当前可见岗位列表 | [ ] |
 | TC-03 | 向下滚动列表页加载更多岗位 | 新加载的岗位自动追加到 SidePanel 列表 | [ ] |
-| TC-04 | 点击列表中某个岗位卡片 | 右侧详情面板加载；Boss 详情面板 JD 加载后，SidePanel 自动触发分析 | [ ] |
+| TC-04 | 点击列表中某个岗位卡片，然后点击详情区「加载 Boss 详情并分析」按钮（或按 Enter） | Boss 页面自动点击对应卡片展开详情面板；JD 加载后 SidePanel 自动触发分析 | [ ] |
 | TC-05 | 等待 10 - 30 秒 | `AnalysisCard` 显示技能/关键词/资历/难度/薪资区间/公司信息/隐藏要求 | [ ] |
 | TC-06 | 分析完成后继续等待 | `MatchCard` 显示综合匹配分、BM25/语义子分、命中/缺失技能、投递建议 | [ ] |
 | TC-07 | 匹配完成后继续等待 | `CommunicationCard` 显示招呼语、跟进语、完整话术 | [ ] |
@@ -234,7 +234,7 @@ dist/assets/content.ts-BfMsJyWr.js           8.10 kB
 |------|----------|----------|
 | SidePanel 显示「未登录」 | SW 内存 token 丢失 | 重新登录；检查 `background/service_worker.ts` 控制台 |
 | 岗位列表为空 | API 拦截未命中 / Content Script 未注入 / 选择器失效 | 在 Boss 页面 F12 → Console，搜索 `[BossInterceptor]` 和 `[AI Career Copilot]` 日志；确认 Network 中有 `/wapi/zpgeek/pc/recommend/job/list.json` 请求 |
-| 点击卡片不分析 | `source_url_map` 未找到 jobId / JD 为空 | SW 控制台搜索 `JOB_DETAIL_EXTRACTED` 与 `source_url_map` |
+| 点击卡片不分析 | 未点击「加载 Boss 详情并分析」按钮；或 `source_url_map` 未找到 jobId / JD 为空 | SW 控制台搜索 `LOAD_JOB_DETAIL`、`JOB_DETAIL_EXTRACTED` 与 `source_url_map` |
 | 分析/话术一直 loading | RabbitMQ 未消费 / LLM 超时 | 后端日志 + `GET /api/tasks/{task_id}` 响应 |
 | 复制无效 | SidePanel 无剪贴板权限 | 检查 manifest `permissions` 是否含 `clipboardWrite` |
 | 关闭 SidePanel 后状态丢失 | `chrome.storage.local` 写入失败 | SidePanel Console 搜索 `[store] 持久化状态失败` |
