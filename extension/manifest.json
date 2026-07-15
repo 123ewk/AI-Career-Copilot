@@ -29,12 +29,6 @@
   "side_panel": {
     "default_path": "sidepanel.html"
   },
-  "web_accessible_resources": [
-    {
-      "resources": ["interceptor.js"],
-      "matches": ["https://www.zhipin.com/*"]
-    }
-  ],
   "background": {
     "service_worker": "src/background/service_worker.ts",
     "type": "module"
@@ -44,6 +38,12 @@
       "matches": ["https://www.zhipin.com/*"],
       "js": ["src/content/content.ts"],
       "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["interceptor.js"],
+      "matches": ["https://www.zhipin.com/*"]
     }
   ]
 }

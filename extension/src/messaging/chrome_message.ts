@@ -87,6 +87,29 @@ export const ChromeMessageType = {
    * 导致 JD 无法补充、AI 分析无法触发的问题。
    */
   LOAD_JOB_DETAIL: "LOAD_JOB_DETAIL",
+
+  /**
+   * Content Script / Service Worker 发送运行时日志到后端
+   *
+   * 用于把浏览器扩展关键路径日志汇总到后端终端，便于前后端日志一体化调试。
+   */
+  LOG: "LOG",
+
+  /**
+   * SidePanel / Popup 请求重置全部提取状态
+   *
+   * 用于：SidePanel 重新打开、用户登出后重新登录、手动重置。
+   * Content Script 收到后清空 apiDataCaptured / sentJobTracker / observer，
+   * Service Worker 收到后清空 source_url_map / task_poller。
+   */
+  RESET_EXTRACTION_STATE: "RESET_EXTRACTION_STATE",
+
+  /**
+   * 登出时通知 Service Worker 清空内存中的 token 缓存
+   *
+   * 流程：Popup 先清 chrome.storage.local → 再发此消息让 SW 清内存
+   */
+  CLEAR_TOKEN_CACHE: "CLEAR_TOKEN_CACHE",
 } as const
 
 /** 消息类型字面量联合（用于泛型约束） */
@@ -165,6 +188,8 @@ export interface ChromeMessagePayloadMap {
       email: string
       name: string
     }
+    /** token 有效期（秒），从登录接口的 expires_in 字段获取，用于持久化过期时间 */
+    expiresIn?: number
   }
 
   [ChromeMessageType.TASK_STATUS_UPDATED]: {
@@ -246,6 +271,37 @@ export interface ChromeMessagePayloadMap {
     /** 是否为 Boss 列表页 */
     isBossListPage: boolean
   }
+
+  [ChromeMessageType.LOG]: {
+    /** 日志条目列表 */
+    logs: Array<{
+      level: 'debug' | 'info' | 'warn' | 'error'
+      source: 'content' | 'service_worker' | 'interceptor' | 'sidepanel'
+      message: string
+      timestamp?: number
+      context?: Record<string, unknown>
+    }>
+  }
+
+  /**
+   * RESET_EXTRACTION_STATE 载荷：请求重置提取状态
+   *
+   * - clearSidePanelStorage 为 true 时，同时清除持久化的 sidepanel_state（登出场景）
+   */
+  [ChromeMessageType.RESET_EXTRACTION_STATE]: {
+    /** 是否同时清空持久化的 sidepanel_state（登出时用） */
+    clearSidePanelStorage?: boolean
+  }
+
+  /**
+   * CLEAR_TOKEN_CACHE 载荷：登出时通知 Service Worker 清空内存中的 token 缓存
+   *
+   * 设计动机：
+   * - 登出流程：Popup 先清 chrome.storage.local → 再发此消息让 SW 清内存
+   * - 分离 storage 清除和内存清除，避免 async 间隙中 SW 用旧内存 token 发请求
+   * - 比 AUTH_TOKEN_UPDATED(null) 更语义化：专门用于清缓存，不涉及 backendUrl 等其他状态
+   */
+  [ChromeMessageType.CLEAR_TOKEN_CACHE]: Record<string, never>
 }
 
 /** 通用消息结构 */

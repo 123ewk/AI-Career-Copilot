@@ -33,6 +33,7 @@ interface UserInfo {
 interface SwState {
   hasToken: boolean
   backendUrl: string
+  user: UserInfo | null
 }
 
 const BACKEND_URL = 'http://localhost:8000'
@@ -58,26 +59,81 @@ async function checkBackend() {
   }
 }
 
-/** 查询 SW 内存中的登录态 */
+/**
+ * 查询 SW 登录态（Popup 初始化时调用）
+ *
+ * 流程：
+ * 1. 优先通过 GET_SW_STATE 查询 SW（SW 会从 chrome.storage.local 读 token）
+ * 2. 若 SW 无响应，直接读 chrome.storage.local 作为兜底
+ * 3. 无有效 token → 显示登录页
+ */
 async function checkLoginState() {
-  // GET_SW_STATE 是 SW 内部查询消息，不走 ChromeMessageType 枚举
-  return new Promise<void>((resolve) => {
+  // 调试：直接读 storage 打印当前存储状态
+  await new Promise<void>((resolve) => {
+    chrome.storage.local.get(['auth_state', 'access_token', 'token_expire'], (data) => {
+      const authState = data.auth_state as { accessToken?: string; expiresAt?: number } | undefined
+      console.log('[popup] 初始化 storage 状态:', {
+        auth_state: authState ? {
+          hasToken: !!authState.accessToken,
+          expiresAt: authState.expiresAt
+            ? new Date(authState.expiresAt).toISOString()
+            : null,
+        } : '(不存在)',
+        access_token: data.access_token ? '***已存在***' : '(不存在)',
+        token_expire: data.token_expire ?? '(不存在)',
+      })
+      resolve()
+    })
+  })
+
+  // 方式 1：通过 SW 查询登录态
+  const swResult = await new Promise<boolean>((resolve) => {
     chrome.runtime.sendMessage(
       { type: 'GET_SW_STATE' },
-      (response: { ok: boolean; data?: SwState }) => {
+      (response: { ok: boolean; data?: SwState; error?: string }) => {
         if (chrome.runtime.lastError || !response?.ok) {
-          // SW 可能尚未启动或未注册 handler
-          isLoggedIn.value = false
-          resolve()
+          console.warn('[popup] SW 未响应，将直接检查 storage |', response?.error ?? chrome.runtime.lastError?.message)
+          resolve(false)
           return
         }
         const state = response.data
-        isLoggedIn.value = state?.hasToken ?? false
         swBackendUrl.value = state?.backendUrl ?? BACKEND_URL
-        resolve()
+        userInfo.value = state?.user ?? null
+        console.log('[popup] SW 登录态 | hasToken=', state?.hasToken, '| backend=', swBackendUrl.value)
+        resolve(state?.hasToken ?? false)
       },
     )
   })
+
+  if (swResult) {
+    isLoggedIn.value = true
+    return
+  }
+
+  // 方式 2：SW 无有效 token，直接读 storage 兜底
+  const storageResult = await new Promise<boolean>((resolve) => {
+    chrome.storage.local.get(['auth_state'], (data) => {
+      const state = data.auth_state as { accessToken?: string; expiresAt?: number } | undefined
+      if (!state?.accessToken) {
+        console.log('[popup] storage 中无 auth_state，显示登录页')
+        resolve(false)
+        return
+      }
+      // 检查 token 是否过期
+      if (state.expiresAt && Date.now() >= state.expiresAt - 60000) {
+        console.log('[popup] storage 中 token 已过期 | expiresAt=', new Date(state.expiresAt).toISOString())
+        resolve(false)
+        return
+      }
+      console.log('[popup] storage 中有有效 token，但 SW 未恢复 | 剩余=', Math.round((state.expiresAt! - Date.now()) / 1000), 's')
+      resolve(true)
+    })
+  })
+
+  isLoggedIn.value = storageResult
+  if (!isLoggedIn.value) {
+    userInfo.value = null
+  }
 }
 
 /** 登录成功回调 */
@@ -85,6 +141,17 @@ function handleLoggedIn(payload: { user: UserInfo; backendUrl: string }) {
   userInfo.value = payload.user
   swBackendUrl.value = payload.backendUrl
   isLoggedIn.value = true
+  // 登录后验证 storage 写入
+  setTimeout(() => {
+    chrome.storage.local.get(['auth_state'], (data) => {
+      const state = data.auth_state as { accessToken?: string; expiresAt?: number } | undefined
+      console.log('[popup] 登录后 storage 验证:', {
+        hasToken: !!state?.accessToken,
+        tokenPreview: state?.accessToken ? `${state.accessToken.slice(0, 12)}...` : null,
+        expiresAt: state?.expiresAt ? new Date(state.expiresAt).toISOString() : null,
+      })
+    })
+  }, 500)
 }
 
 /** 打开 SidePanel（需要用户手势触发，Popup 点击符合 MV3 要求） */
@@ -94,12 +161,59 @@ async function openSidePanel() {
   window.close()
 }
 
-/** 登出（清除 SW 内存中的 token） */
+/** 登出（清除 SW 内存 token、storage、source_url_map、轮询、Content Script 状态） */
 async function handleLogout() {
-  await sendMessageToBackground(ChromeMessageType.AUTH_TOKEN_UPDATED, {
-    accessToken: null,
-    backendUrl: swBackendUrl.value,
+  // 0. 登出前：打印当前 storage 中的登录字段（调试用）
+  await new Promise<void>((resolve) => {
+    chrome.storage.local.get(['auth_state', 'access_token', 'token_expire'], (before) => {
+      console.log('[popup] 登出前 storage 状态:', {
+        auth_state: before.auth_state ?? '(不存在)',
+        access_token: before.access_token ? '***已存在***' : '(不存在)',
+        token_expire: before.token_expire ?? '(不存在)',
+      })
+      resolve()
+    })
   })
+
+  // 1. 批量清除 chrome.storage.local 中所有登录相关 key（含当前 + 历史遗留）
+  const AUTH_KEYS_TO_CLEAR = [
+    'auth_state',       // 当前版本：{ backendUrl, accessToken, expiresAt }
+    'access_token',     // 历史遗留：独立 token 字段
+    'token_expire',     // 历史遗留：独立过期时间字段
+    'token_expires_at', // 防御：其他可能的命名变体
+  ]
+  await new Promise<void>((resolve) => {
+    chrome.storage.local.remove(AUTH_KEYS_TO_CLEAR, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('[popup] 清除 storage 失败:', chrome.runtime.lastError.message)
+      } else {
+        console.log('[popup] storage 登录字段已批量清除 | keys=', AUTH_KEYS_TO_CLEAR)
+      }
+      resolve()
+    })
+  })
+
+  // 1.5 登出后验证：确认 storage 已清空
+  await new Promise<void>((resolve) => {
+    chrome.storage.local.get(AUTH_KEYS_TO_CLEAR, (after) => {
+      const remaining = AUTH_KEYS_TO_CLEAR.filter((k) => after[k] !== undefined)
+      if (remaining.length > 0) {
+        console.error('[popup] ⚠️ storage 清除不彻底，残留 key:', remaining)
+      } else {
+        console.log('[popup] ✅ storage 登录字段已全部清除')
+      }
+      resolve()
+    })
+  })
+
+  // 2. 通知 SW 清空内存中的 token 缓存
+  await sendMessageToBackground(ChromeMessageType.CLEAR_TOKEN_CACHE, {})
+
+  // 3. 通知 SW + Content Script 重置全部提取状态，并清空 sidepanel_state
+  await sendMessageToBackground(ChromeMessageType.RESET_EXTRACTION_STATE, {
+    clearSidePanelStorage: true,
+  })
+
   isLoggedIn.value = false
   userInfo.value = null
 }

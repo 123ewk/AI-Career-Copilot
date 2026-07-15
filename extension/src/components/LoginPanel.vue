@@ -257,6 +257,7 @@ async function handleSubmit() {
           email: data.user.email,
           name: data.user.name,
         },
+        expiresIn: data.expires_in,
       },
     )
 
@@ -465,7 +466,7 @@ function switchMode(newMode: 'login' | 'register') {
 
     <!-- 安全说明 -->
     <p class="security-hint">
-      🔒 access_token 仅存 Service Worker 内存，不写入 localStorage；
+      🔒 access_token 持久化在 chrome.storage.local（扩展私有存储），关闭弹窗不丢失；
       refresh_token 由 HttpOnly Cookie 自动管理。
     </p>
   </div>

@@ -9,6 +9,7 @@
  * 输入来源：
  * - /wapi/zpgeek/pc/recommend/job/list.json
  * - /wapi/zpgeek/search/job/list.json
+ * - /wapi/zpgeek/job/list.json
  *
  * 输出：
  * - RawBossJob[]，可直接复用现有消息链路发送给 Service Worker
@@ -203,6 +204,7 @@ export function isJobListApiPayload(payload: CapturedApiPayload): boolean {
   const patterns = [
     '/wapi/zpgeek/pc/recommend/job/list.json',
     '/wapi/zpgeek/search/job/list.json',
+    '/wapi/zpgeek/job/list.json',
   ]
   return patterns.some((pattern) => payload.url.includes(pattern))
 }

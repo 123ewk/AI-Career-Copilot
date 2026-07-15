@@ -39,6 +39,7 @@ from app.api.routers import (
     applications,
     auth,
     communication,
+    extension_log,
     health,
     jobs,
     match,
@@ -216,6 +217,7 @@ def create_app() -> FastAPI:
     # 健康检查放根路径 /health，不挂 /api 前缀，方便探针和 Docker HEALTHCHECK 访问
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/api/auth", tags=["认证"])
+    app.include_router(extension_log.router, prefix="/api/extension", tags=["扩展日志"])
     app.include_router(user.router, prefix="/api/users", tags=["用户"])
     app.include_router(resume.router, prefix="/api/resumes", tags=["简历"])
     app.include_router(jobs.router, prefix="/api/jobs", tags=["岗位"])

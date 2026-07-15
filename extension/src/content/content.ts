@@ -2,28 +2,17 @@
  * Content Script 入口
  *
  * 职责：
- * - 兜底注入主世界拦截器（主路径为 SW 的 registerContentScripts）
- * - 接收主世界拦截器通过 postMessage 发送的 API 响应数据
+ * - 监听主世界拦截器（interceptor.js）通过 postMessage 发送的 API 数据
  * - 解析数据为 RawBossJob，通过现有消息链路发送给 Service Worker
  * - 监听详情面板变化，补充 JD / 技能等信息
  * - 监听卡片点击，记录选中岗位的 detailUrl
  * - 监听 SPA URL 变化，切换搜索条件时重置状态
  *
- * 消息流向：
- *   主世界 interceptor.js → window.postMessage → Content Script → chrome.runtime.sendMessage → Service Worker → 后端
- *
- * 拦截器注入策略（双路径）：
- * - 主路径：SW 通过 chrome.scripting.registerContentScripts 注册
- *   world: 'MAIN' + runAt: 'document_start'（无竞态,早于页面 JS）
- * - 兜底路径：Content Script 通过 <script> 标签注入
- *   （有竞态,但确保主路径失败时数据链路不断）
- * - interceptor.js 的 __bossJobInterceptorInstalled 标志防重复安装
- *
- * 设计动机：
- * - adapter.ts 仅保留详情面板 DOM 监听和 URL 轮询,不再作为列表数据 fallback
- *   (DOM 提取的薪资受字体反爬影响为乱码,已废弃)
- * - api_parser.ts 将 Boss 内部 API 响应转换为现有 RawBossJob 格式
- * - 不直接调用 chrome.storage / fetch（在 Content Script 中受限，由 SW 代理）
+ * 拦截器策略：
+ * - 主世界拦截器通过 registerContentScripts (world: 'MAIN') 注入
+ * - 在页面 JS 执行前 hook fetch/XHR，捕获 API 响应
+ * - 通过 postMessage 将数据发送给 Content Script（isolated world）
+ * - Content Script 接收后解析并发送给 Service Worker
  *
  * 运行环境：
  * - Content Script 隔离世界，可访问 document/window，但不能访问页面 JS 变量
@@ -44,36 +33,92 @@ import {
   isJobListApiPayload,
   type CapturedApiPayload,
 } from '../modules/boss/api_parser'
+import { remoteLog, flushRemoteLogs } from '../logging/remote_logger'
 
-// ==================== 主世界拦截器注入（兜底） ====================
+// ==================== 主世界拦截器数据接收 ====================
 
 /**
- * 向页面主世界注入 API 拦截器脚本（兜底路径）
+ * 监听主世界拦截器发送的消息
  *
- * 主路径：SW 通过 chrome.scripting.registerContentScripts 在 document_start
- * 注入 world: 'MAIN' 的 interceptor.js（无竞态，早于页面 JS）。
- *
- * 兜底路径：如果 SW 注册失败（onInstalled 未触发、Chrome 版本不支持
- * world: 'MAIN' 等），Content Script 通过 <script> 标签注入，确保拦截器
- * 至少能装上（有 race condition，但数据链路不断）。
- *
- * interceptor.js 的 __bossJobInterceptorInstalled 标志防止重复安装，
- * 两条路径安全共存。
+ * 主世界拦截器（interceptor.js）通过 registerContentScripts 注入，
+ * 在页面 JS 执行前 hook fetch/XHR，捕获到数据后通过 postMessage 发送。
+ * Content Script 在 isolated world 中监听 message 事件接收数据。
  */
-function injectBossApiInterceptor(): void {
-  if (document.querySelector('script[data-boss-interceptor]')) {
+window.addEventListener('message', (event: MessageEvent) => {
+  // 只处理 Boss 职位数据消息
+  if (event.data?.type !== 'BOSS_JOB_DATA_CAPTURED') {
     return
   }
 
-  const script = document.createElement('script')
-  script.src = chrome.runtime.getURL('interceptor.js')
-  script.dataset.bossInterceptor = 'true'
-  script.onload = () => script.remove()
-  ;(document.head || document.documentElement).appendChild(script)
+  // 确保消息来自同一窗口
+  if (event.source !== window) {
+    return
+  }
+
+  const capturedData = event.data.payload as CapturedApiPayload
+
+  remoteLog('info', '[postMessage] received job data from main world', {
+    url: capturedData.url?.slice(0, 120),
+  })
+
+  handleCapturedPayload(capturedData)
+})
+
+/**
+ * 监听主世界拦截器发送的日志消息
+ *
+ * 主世界拦截器通过 postMessage 发送日志，Content Script 转发到后端终端。
+ */
+window.addEventListener('message', (event: MessageEvent) => {
+  if (event.data?.type !== 'BOSS_INTERCEPTOR_LOG') {
+    return
+  }
+
+  if (event.source !== window) {
+    return
+  }
+
+  const { level, message, context } = event.data.payload
+  remoteLog(level, `[main-world] ${message}`, context)
+})
+
+/**
+ * 处理捕获到的 API 响应
+ *
+ * 从主世界拦截器接收数据后解析并发送给 Service Worker。
+ */
+function handleCapturedPayload(payload: CapturedApiPayload): void {
+  if (!isJobListApiPayload(payload)) return
+
+  try {
+    const result = parseBossApiResponse(payload, window.location.href)
+    if (result.jobs.length === 0) return
+
+    const newJobs = sentJobTracker.filterNewJobs(result.jobs)
+    if (newJobs.length === 0) {
+      remoteLog('info', `[source=API] interceptor returned ${result.jobs.length} jobs, all duplicates`)
+      return
+    }
+
+    clearApiTimeout()
+    apiDataCaptured = true  // 标记 API 数据已捕获，阻止后续超时触发
+
+    remoteLog('info', `[source=API] interceptor captured data: parsed ${result.jobs.length} jobs, ${newJobs.length} new (DOM fallback cancelled)`, {
+      jobCount: result.jobs.length,
+      newJobCount: newJobs.length,
+    })
+    remoteLog('info', 'PATH_DECISION: 用户获取首屏数据走的是 API 拦截器路径', {
+      path: 'api_interceptor',
+      jobCount: newJobs.length,
+    })
+    flushRemoteLogs()
+    void sendJobsExtracted(window.location.href, newJobs)
+  } catch (err) {
+    remoteLog('error', 'Error parsing captured API data', { error: err instanceof Error ? err.message : String(err) })
+  }
 }
 
-// 立即注入，确保在 Boss 页面发起职位列表请求前完成安装
-injectBossApiInterceptor()
+remoteLog('info', 'Content script started. Waiting for main world interceptor data via postMessage. Fallback: DOM extraction after timeout.')
 
 // ==================== 已发送岗位去重 ====================
 
@@ -117,46 +162,6 @@ class SentJobTracker {
 }
 
 const sentJobTracker = new SentJobTracker()
-
-// ==================== 监听主世界消息（API 数据） ====================
-
-/**
- * 监听主世界拦截器通过 postMessage 发送的职位列表数据
- *
- * 只处理来自同一窗口、类型为 BOSS_JOB_DATA_CAPTURED 的消息。
- */
-window.addEventListener('message', (event: MessageEvent) => {
-  if (event.source !== window) return
-  if (event.data?.type !== 'BOSS_JOB_DATA_CAPTURED') return
-
-  const payload = event.data.payload as CapturedApiPayload
-  if (!payload || !isJobListApiPayload(payload)) return
-
-  console.log(
-    '[AI Career Copilot] Captured Boss API response:',
-    payload.url.slice(0, 120),
-  )
-
-  try {
-    const result = parseBossApiResponse(payload, window.location.href)
-    if (result.jobs.length === 0) return
-
-    const newJobs = sentJobTracker.filterNewJobs(result.jobs)
-    if (newJobs.length === 0) {
-      console.log(
-        `[AI Career Copilot] API returned ${result.jobs.length} jobs, all duplicates`,
-      )
-      return
-    }
-
-    console.log(
-      `[AI Career Copilot] API parsed ${result.jobs.length} jobs, ${newJobs.length} new`,
-    )
-    void sendJobsExtracted(window.location.href, newJobs)
-  } catch (error) {
-    console.error('[AI Career Copilot] Error parsing captured API data:', error)
-  }
-})
 
 // ==================== 选中岗位追踪（详情面板关联用） ====================
 
@@ -245,33 +250,246 @@ if (pageInfo.isListPage) {
 }
 
 /**
+ * 清空 DOM 提取岗位的薪资字段
+ *
+ * Boss 的字体反爬是永久的字符映射（PUA Unicode → 数字字形），
+ * innerText 返回 PUA 字符而非数字，字体加载与否不影响。
+ * 清空 salaryRaw 避免 DOM 乱码覆盖 API 拦截器的明文薪资。
+ */
+function stripDomSalary(jobs: RawBossJob[]): RawBossJob[] {
+  return jobs.map((j) => ({ ...j, salaryRaw: '' }))
+}
+
+/**
+ * 首屏 DOM 兜底提取
+ *
+ * 当 API 拦截器超时/失效时提供首屏数据来源（title/company/tags/location，不含薪资）。
+ * 由 setupApiTimeout 在 API 超时后触发，不主动调用。
+ */
+function runDomFallbackForInitialPage(): void {
+  // 临时诊断代码，验证后移除：记录 5s 超时时的 DOM 状态，区分「DOM 无 jobCard 元素」和「有元素但 extractJobs 没提取到」
+  const diagTs = Date.now()
+  const listContainerExists = !!document.querySelector(BOSS_SELECTORS.list.listContainer)
+  const domJobCardCount = document.querySelectorAll(BOSS_SELECTORS.list.jobCard).length
+  remoteLog(
+    'info',
+    '[diag] runDomFallback enter',
+    { ts: diagTs, readyState: document.readyState, listContainerExists, domJobCardCount },
+  )
+  remoteLog(
+    'info',
+    '[source=DOM-fallback] API interceptor did not capture usable data; starting DOM fallback extraction',
+  )
+  const jobs = bossAdapter.extractJobs()
+  if (jobs.length === 0) {
+    remoteLog('info', '[source=DOM-fallback] no jobs found on page', {
+      ts: diagTs,
+      domJobCardCount,
+      listContainerExists,
+    })
+    remoteLog(
+      'warn',
+      'PATH_DECISION: API 拦截器 5s 超时未捕获数据，DOM 兜底暂未发现已渲染卡片。' +
+        'MutationObserver 仍在监听，页面渲染完成后将自动捕获',
+      { path: 'waiting', reason: 'api_timeout_and_dom_not_ready', domJobCardCount },
+    )
+    return
+  }
+  const newJobs = sentJobTracker.filterNewJobs(jobs)
+  if (newJobs.length === 0) {
+    remoteLog(
+      'info',
+      `[source=DOM-fallback] ${jobs.length} jobs already captured by API (skipped)`,
+    )
+    return
+  }
+  remoteLog(
+    'info',
+    `[source=DOM-fallback] extracted ${newJobs.length} new jobs`,
+    { jobCount: jobs.length, newJobCount: newJobs.length, ts: diagTs, domJobCardCount },
+  )
+  remoteLog(
+    'warn',
+    'PATH_DECISION: 用户获取首屏数据走的是 DOM 兜底路径（API 拦截器未捕获到数据）',
+    { path: 'dom_fallback', jobCount: newJobs.length, domJobCardCount },
+  )
+  flushRemoteLogs()
+  void sendJobsExtracted(window.location.href, stripDomSalary(newJobs))
+}
+
+// ==================== API 超时 → DOM 兜底 ====================
+
+const API_TIMEOUT_MS = 5000
+let apiTimeoutTimer: ReturnType<typeof setTimeout> | null = null
+let apiDataCaptured = false  // 标记 API 数据是否已捕获，防止超时后重复触发
+
+function clearApiTimeout(): void {
+  if (apiTimeoutTimer) {
+    clearTimeout(apiTimeoutTimer)
+    apiTimeoutTimer = null
+  }
+}
+
+/**
+ * 重置 Content Script 全部提取状态
+ *
+ * SidePanel 重新打开 / 登出后重新登录时调用：
+ * - 清空 API 捕获标记与超时定时器
+ * - 清空已发送岗位去重器
+ * - 清空当前选中岗位与列表页 URL
+ * - 断开并重新挂载 adapter observer
+ */
+function resetExtractionState(): void {
+  clearApiTimeout()
+  apiDataCaptured = false
+  sentJobTracker.clear()
+  currentSelectedDetailUrl = ''
+  currentListPageUrl = window.location.href
+  bossAdapter.disconnect()
+  initListPage()
+
+  remoteLog('info', '[content] RESET_EXTRACTION_STATE 完成，重新初始化列表页提取')
+}
+
+/**
+ * 设置 API 超时定时器
+ *
+ * 设计说明：
+ * - API 拦截器本身是常驻监听的（hook 了 fetch/XHR），不会因超时而停止
+ * - 这个 5 秒超时是 Content Script 侧的"首屏降级"机制：
+ *   如果 5 秒内拦截器没捕获到首屏 API 数据，就用 DOM 兜底提供基本数据
+ * - 超时后拦截器仍在运行，后续如果捕获到 API 数据（如滚动加载），
+ *   会通过 sentJobTracker 去重，不会重复发送
+ * - 如果首屏 API 数据在 DOM 兜底之后到达，API 数据会被去重跳过
+ *   （薪资信息会丢失，但这是可接受的降级代价）
+ *
+ * API 捕获到数据时调用 clearApiTimeout() 取消定时器。
+ */
+function setupApiTimeout(): void {
+  clearApiTimeout()
+
+  // 如果 API 数据已经被捕获，不再设置超时
+  if (apiDataCaptured) {
+    remoteLog('info', '[source=API] 数据已捕获，跳过超时设置')
+    return
+  }
+
+  apiTimeoutTimer = setTimeout(() => {
+    // 再次检查，防止在超时触发前 API 数据刚好到达
+    if (apiDataCaptured) {
+      remoteLog('info', '[source=API] 数据已在超时前捕获，取消 DOM 兜底')
+      apiTimeoutTimer = null
+      return
+    }
+    remoteLog(
+      'warn',
+      `[source=API] interceptor did not capture data within ${API_TIMEOUT_MS / 1000}s; will switch to [source=DOM-fallback]`,
+    )
+    runDomFallbackForInitialPage()
+    apiTimeoutTimer = null
+  }, API_TIMEOUT_MS)
+}
+
+// ==================== 启动刷新检测（修复 P3 根因） ====================
+
+/**
+ * sessionStorage key：标记当前 Tab 是否已执行过扩展启动刷新
+ *
+ * 仅用 sessionStorage 防循环，不使用 URL 参数：
+ * - URL 参数需要 history.replaceState 清理，可能干扰 Boss 的 SPA 路由
+ * - sessionStorage 在 Tab 生命周期内有效，刷新后仍存在，足以保证只刷新一次
+ */
+const RELOAD_FLAG_KEY = '__acc_extension_reloaded'
+
+/**
+ * 检测并执行启动刷新
+ *
+ * 场景：用户先打开 Boss 列表页，后启用/安装扩展。
+ * 此时页面 API 已完成，拦截器来不及拦截。
+ * 通过 location.reload() 刷新页面，让拦截器在 document_start 注入后
+ * 能拦住刷新后的 API 调用。
+ *
+ * 防循环：仅用 sessionStorage 标记，同一 Tab 会话只刷新一次。
+ * SPA 路由切换不会触发（URL 不变，不走 initListPage 的刷新分支）。
+ * REFRESH_JOBS（手动刷新）不清除此标记，F3 与 F5 职责独立。
+ *
+ * @returns true 表示已触发刷新，调用方应停止后续初始化
+ */
+function maybeReloadOnStartup(): boolean {
+  // 已经刷新过（sessionStorage 标记存在），跳过
+  if (sessionStorage.getItem(RELOAD_FLAG_KEY)) {
+    return false
+  }
+
+  // 页面仍在加载中，拦截器有机会拦住 API，不需要刷新
+  if (document.readyState === 'loading') {
+    return false
+  }
+
+  // 页面已加载完成（interactive / complete），API 已结束
+  // 标记并刷新，让拦截器在下次 document_start 注入后生效
+  sessionStorage.setItem(RELOAD_FLAG_KEY, '1')
+  remoteLog(
+    'warn',
+    'PATH_DECISION: 扩展在已加载页面启动，主动刷新以确保 API 拦截器生效',
+    { path: 'startup_reload', readyState: document.readyState },
+  )
+  flushRemoteLogs()
+  location.reload()
+  return true
+}
+
+/**
  * 列表页初始化逻辑
  *
- * 职责：
- * 1. 监听列表 DOM 变化（滚动加载追加新卡片），作为 API 拦截器的补充数据源
- * 2. 监听详情面板变化，补充 JD / 技能
- * 3. 监听 URL 变化，切换搜索条件时重置去重器
+ * 数据源优先级：
+ * 1. API 拦截器（主路径）：捕获 Boss 的 /wapi/zpgeek/.../job/list.json 响应
+ * 2. DOM observer（滚动补充）：监听 .rec-job-list 子节点变化，提取新卡片
+ * 3. DOM 首屏兜底：API 5 秒超时后触发，提供首屏数据（薪资为空）
  *
- * 数据源优先级（通过 sentJobTracker 按 detailUrl 去重自动协调）：
- * - API 拦截器（主路径）：捕获 Boss 的 /wapi/zpgeek/.../job/list.json 响应
- * - DOM observer（补充）：监听 .rec-job-list 子节点变化，提取新卡片
- *
- * 不会有首屏乱码问题的原因：
- * - 首屏数据由 API 拦截器提供（registerContentScripts 在 document_start 注入）
- * - DOM observer 在滚动加载时触发，此时自定义字体已加载，innerText 返回正常字符
- * - sentJobTracker 确保不重复发送（API 已捕获的岗位 DOM 会跳过）
+ * 时序：
+ * - 页面加载 → API 拦截器在 document_start 注入 → 捕获首屏 API 请求
+ * - 如果 5 秒内 API 未捕获到数据 → 触发 DOM 兜底
+ * - API 捕获到数据后取消超时，不再触发 DOM 兜底
  */
 function initListPage(): void {
+  // 临时诊断代码，验证后移除：记录 initListPage 进入时序和 maybeReloadOnStartup 决策
+  const initTs = Date.now()
+  remoteLog(
+    'info',
+    '[diag] initListPage enter',
+    { ts: initTs, readyState: document.readyState },
+  )
+  // 启动刷新检测：如果页面已加载完成，刷新让拦截器生效
+  if (maybeReloadOnStartup()) {
+    remoteLog('info', '[diag] maybeReloadOnStartup result', { ts: initTs, reloaded: true })
+    return
+  }
+  remoteLog('info', '[diag] maybeReloadOnStartup result', { ts: initTs, reloaded: false })
+
+  // 重置 API 数据捕获标记（新页面加载时）
+  apiDataCaptured = false
+  setupApiTimeout()
+
   bossAdapter.observe({
     onJobsExtracted: (jobs) => {
-      // DOM observer 作为 API 拦截器的补充：
-      // sentJobTracker 按 detailUrl 去重，API 已捕获的会被跳过
       const newJobs = sentJobTracker.filterNewJobs(jobs)
       if (newJobs.length > 0) {
-        console.log(
-          `[AI Career Copilot] DOM observer: ${newJobs.length} new jobs (scroll/append)`,
+        remoteLog(
+          'info',
+          `[source=DOM-observer] ${newJobs.length} new jobs (scroll/append)`,
+          { newJobCount: newJobs.length },
         )
-        void sendJobsExtracted(window.location.href, newJobs)
+        remoteLog(
+          'info',
+          'PATH_DECISION: 用户获取滚动加载数据走的是 DOM observer 路径',
+          { path: 'dom_observer', jobCount: newJobs.length },
+        )
+        flushRemoteLogs()
+        void sendJobsExtracted(
+          window.location.href,
+          stripDomSalary(newJobs),
+        )
       }
     },
     onDetailExtracted: (detail) => {
@@ -286,6 +504,7 @@ function initListPage(): void {
       if (isListPage && url !== currentListPageUrl) {
         currentListPageUrl = url
         bossAdapter.disconnect()
+        clearApiTimeout()
         sentJobTracker.clear()
         currentSelectedDetailUrl = ''
         initListPage()
@@ -384,14 +603,39 @@ function clickBossJobCard(sourceUrl: string): { ok: boolean; error?: string } {
  * 监听 Service Worker 转发的消息
  *
  * 当前处理：
- * - REFRESH_JOBS：SidePanel 手动刷新（API 拦截模式下数据被动捕获,此 handler 仅返回 ok）
+ * - REFRESH_JOBS：SidePanel 手动刷新，清空去重器 + 重新加载页面让 API 拦截器重新拦截
  * - LOAD_JOB_DETAIL：SidePanel 请求点击 Boss 页面对应岗位卡片，加载详情面板
  */
 onMessage((message) => {
   switch (message.type) {
     case ChromeMessageType.REFRESH_JOBS: {
-      // API 拦截模式下数据被动捕获,手动刷新无需主动提取。
-      // 用户滚动列表或 Boss 页面自己发起 API 请求时,拦截器会自动命中。
+      // 用户手动刷新：清空去重器，让 API 拦截器重新拦截首屏 API
+      //
+      // 关键：不清除 sessionStorage 启动标记，F3 与 F5 职责独立
+      // - F3（启动刷新）只在首次扩展启动时触发一次，避免循环
+      // - F5（手动刷新）由用户/SidePanel 主动触发，应当能 reload
+      //
+      // readyState 防护：若页面仍在 loading（可能正被 F3 触发的刷新加载中），
+      // 不再二次 reload，仅重置 API 超时，等待当前加载完成自然触发 API 拦截
+      remoteLog(
+        'info',
+        'PATH_DECISION: 用户手动刷新，清空去重器',
+        { path: 'manual_refresh', readyState: document.readyState },
+      )
+      sentJobTracker.clear()
+      flushRemoteLogs()
+      if (document.readyState === 'complete') {
+        // reload 会中断当前消息通道，先返回 ok，再异步 reload
+        setTimeout(() => location.reload(), 0)
+      } else {
+        // 页面仍在加载：reload 会与 F3 的刷新叠加导致双重刷新循环
+        // 仅重置 API 超时，等当前页面加载完成
+        setupApiTimeout()
+      }
+      return { ok: true }
+    }
+    case ChromeMessageType.RESET_EXTRACTION_STATE: {
+      resetExtractionState()
       return { ok: true }
     }
     case ChromeMessageType.LOAD_JOB_DETAIL: {

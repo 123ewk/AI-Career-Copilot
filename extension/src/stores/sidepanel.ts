@@ -344,7 +344,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
         if (job) {
           job.id = c.jobId
           job.createStatus = 'created'
-          job.salaryRaw = c.salaryRaw
+          if (c.salaryRaw) job.salaryRaw = c.salaryRaw
           job.location = c.location
           job.tags = c.tags
         } else {
@@ -367,7 +367,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
         if (job) {
           job.id = c.jobId
           job.createStatus = 'created'
-          job.salaryRaw = c.salaryRaw
+          if (c.salaryRaw) job.salaryRaw = c.salaryRaw
           job.location = c.location
           job.tags = c.tags
         } else {
@@ -389,7 +389,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
         if (job) {
           job.createStatus = 'failed'
           job.createError = c.error
-          job.salaryRaw = c.salaryRaw
+          if (c.salaryRaw) job.salaryRaw = c.salaryRaw
           job.location = c.location
           job.tags = c.tags
         } else {
