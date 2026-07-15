@@ -64,43 +64,125 @@ function handleLoggedIn(payload: { user: { id: string; email: string; name: stri
   }
 }
 
-/** 查询 SW 内存中的登录态 */
+/** SW 状态查询响应类型 */
+interface SwState {
+  hasToken: boolean
+  backendUrl: string
+  user: { id: string; email: string; name: string } | null
+}
+
+/**
+ * 查询登录态（SW 优先，storage 兜底）
+ *
+ * 流程：
+ * 1. 通过 GET_SW_STATE 查询 SW（SW 会从 chrome.storage.local 读 token 并尝试 refresh）
+ * 2. 若 SW 有 token 但无 user 信息，从 storage 补充 user
+ * 3. 若 SW 无有效 token，直接读 chrome.storage.local 作为兜底
+ * 4. 全部无 token → 显示登录页
+ */
 async function checkLoginState() {
-  return new Promise<void>((resolve) => {
+  // 方式 1：通过 SW 查询登录态
+  const swResult = await new Promise<boolean>((resolve) => {
     if (!isExtensionContextValid()) {
-      store.setUserInfo(null)
-      resolve()
+      resolve(false)
       return
     }
     try {
       chrome.runtime.sendMessage(
         { type: 'GET_SW_STATE' },
-        (response: { ok: boolean; data?: { hasToken: boolean; backendUrl: string } }) => {
+        (response: { ok: boolean; data?: SwState; error?: string }) => {
           if (chrome.runtime.lastError || !response?.ok || !response.data) {
-            // SW 可能尚未启动
-            store.setUserInfo(null)
-            resolve()
+            console.warn('[App] 查询 SW 状态失败:', response?.error ?? chrome.runtime.lastError?.message)
+            resolve(false)
             return
           }
           const state = response.data
-          if (state.hasToken) {
-            // 已登录但 SidePanel 不持有完整 user 信息（Popup 持有）
-            // 用占位信息表示「已登录」状态
-            store.setUserInfo({
-              id: '(in SW memory)',
-              email: '',
-              name: '已登录用户',
-            })
-            store.setBackendUrl(state.backendUrl)
-          } else {
-            store.setUserInfo(null)
+          store.setBackendUrl(state.backendUrl)
+          if (state.user) {
+            store.setUserInfo(state.user)
           }
-          resolve()
+          console.log('[App] SW 登录态 | hasToken=', state.hasToken, '| hasUser=', !!state.user)
+          resolve(state.hasToken ?? false)
         },
       )
     } catch {
-      // 上下文失效时 sendMessage 可能同步抛异常
-      store.setUserInfo(null)
+      resolve(false)
+    }
+  })
+
+  if (swResult) {
+    // SW 有 token 但可能没有 user 信息（SW 重启后从 storage 恢复 token 时 user=null）
+    // 从 storage 补充 user 信息
+    if (!store.isLoggedIn) {
+      await restoreUserFromStorage()
+    }
+    return
+  }
+
+  // 方式 2：SW 无有效 token，直接读 storage 兜底
+  const storageResult = await new Promise<boolean>((resolve) => {
+    try {
+      chrome.storage.local.get(['auth_state'], (data) => {
+        if (chrome.runtime.lastError) {
+          resolve(false)
+          return
+        }
+        const state = data.auth_state as {
+          accessToken?: string
+          expiresAt?: number
+          backendUrl?: string
+          user?: { id: string; email: string; name: string } | null
+        } | undefined
+        if (!state?.accessToken) {
+          console.log('[App] storage 中无 auth_state，显示登录页')
+          resolve(false)
+          return
+        }
+        if (state.expiresAt && Date.now() >= state.expiresAt - 60000) {
+          console.log('[App] storage 中 token 已过期 | expiresAt=', new Date(state.expiresAt).toISOString())
+          resolve(false)
+          return
+        }
+        if (state.backendUrl) {
+          store.setBackendUrl(state.backendUrl)
+        }
+        // 恢复 user 信息（持久化在 auth_state.user 中）
+        if (state.user) {
+          store.setUserInfo(state.user)
+        }
+        console.log('[App] storage 中有有效 token | 剩余=', Math.round((state.expiresAt! - Date.now()) / 1000), 's | user=', state.user?.email ?? 'null')
+        resolve(true)
+      })
+    } catch {
+      resolve(false)
+    }
+  })
+
+  if (!storageResult) {
+    store.setUserInfo(null)
+  }
+}
+
+/**
+ * 从 chrome.storage.local 恢复 user 信息
+ *
+ * 用于：SW 有 token 但 user=null 的场景（SW 重启后从 storage 恢复了 token，
+ * 但旧版本未持久化 user 信息；新版本已持久化，此函数作为兼容兜底）
+ */
+async function restoreUserFromStorage(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(['auth_state'], (data) => {
+        const state = data.auth_state as {
+          user?: { id: string; email: string; name: string } | null
+        } | undefined
+        if (state?.user) {
+          store.setUserInfo(state.user)
+          console.log('[App] 从 storage 恢复 user 信息 | email=', state.user.email)
+        }
+        resolve()
+      })
+    } catch {
       resolve()
     }
   })
@@ -211,6 +293,10 @@ onMounted(async () => {
   // 建立保活端口，保持 SW 在 SidePanel 打开期间活跃
   connectKeepAlivePort()
 
+  // 关键修复：每次打开 SidePanel，先强制重置 Content Script + SW 的提取状态
+  // 避免关闭重开后复用 apiDataCaptured / sentJobTracker / source_url_map 等旧状态
+  await sendMessageToBackground(ChromeMessageType.RESET_EXTRACTION_STATE, {})
+
   // 优先从 chrome.storage.local 恢复上次状态（岗位列表、分析结果、投递记录等）
   await loadFromStorage()
 
@@ -231,11 +317,9 @@ onMounted(async () => {
   if (!store.isLoggedIn) {
     store.setStatus('not_logged_in')
   } else if (store.isBossListPage) {
+    // 状态已重置，强制进入 extracting 并触发刷新，重新完整扫描页面数据
     store.setStatus('extracting')
-    // SidePanel 打开时可能已错过 Content Script 的自动提取消息，主动触发一次刷新
-    if (store.jobs.length === 0) {
-      void handleRefresh()
-    }
+    void handleRefresh()
   } else {
     store.setStatus('idle')
   }

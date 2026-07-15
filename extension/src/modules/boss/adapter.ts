@@ -40,6 +40,8 @@ import {
 } from './selector'
 import type { RawBossJob } from './parser'
 import { cleanJdText } from './parser'
+// 临时诊断代码，验证后移除：用于 setupListObserver 时序诊断
+import { remoteLog } from '../../logging/remote_logger'
 
 /**
  * Boss 页面类型
@@ -96,6 +98,11 @@ const URL_POLL_INTERVAL_MS = 500
  *   }
  */
 export class BossAdapter {
+  /** 列表容器查找最大重试次数 */
+  private static readonly LIST_CONTAINER_MAX_RETRY = 10
+  /** 列表容器重试间隔（ms） */
+  private static readonly LIST_CONTAINER_RETRY_INTERVAL = 500
+
   /** 列表页 MutationObserver（监听 .rec-job-list 子节点变化） */
   private listObserver: MutationObserver | null = null
   /** 详情面板 MutationObserver（监听 .job-detail-box 内容变化） */
@@ -108,6 +115,8 @@ export class BossAdapter {
   private listDebounceTimer: ReturnType<typeof setTimeout> | null = null
   /** 防抖定时器（详情提取） */
   private detailDebounceTimer: ReturnType<typeof setTimeout> | null = null
+  /** 列表容器查找重试定时器集合（避免 reload 后旧重试回调再挂载 observer） */
+  private listRetryTimers: ReturnType<typeof setTimeout>[] = []
 
   /**
    * 检测当前页面类型
@@ -264,6 +273,12 @@ export class BossAdapter {
       clearTimeout(this.detailDebounceTimer)
       this.detailDebounceTimer = null
     }
+
+    // 关键修复：清理所有列表容器重试定时器，避免 reload 后旧回调再挂载 observer
+    for (const timer of this.listRetryTimers) {
+      clearTimeout(timer)
+    }
+    this.listRetryTimers = []
   }
 
   // ==================== 私有方法 ====================
@@ -316,25 +331,58 @@ export class BossAdapter {
   }
 
   /**
-   * 设置列表页 MutationObserver
-   *
-   * 监听 .rec-job-list 的子节点变化（滚动加载、筛选、分页都会触发）
-   * 用 debounce 避免渲染过程中频繁提取
-   */
-  private setupListObserver(onJobsExtracted: (jobs: RawBossJob[]) => void): void {
+ * 设置列表页 MutationObserver
+ *
+ * 监听 .rec-job-list 的子节点变化（滚动加载、筛选、分页都会触发）
+ * 用 debounce 避免渲染过程中频繁提取
+ *
+ * 持续重试：content.ts 在 document_start 注入，此时 DOM 未渲染。
+ * 如果页面网络慢、SSR 延迟，.rec-job-list 可能在数秒后才出现。
+ * 每 500ms 重试一次，最多 10 次（共 5s），确保容器出现后能挂载 observer。
+ */
+private setupListObserver(
+    onJobsExtracted: (jobs: RawBossJob[]) => void,
+    retryCount = 0,
+  ): void {
+    // 临时诊断代码，验证后移除：记录 setupListObserver 时序和 jobCard 渲染时机
+    const diagTs = Date.now()
     const listContainer = document.querySelector(BOSS_SELECTORS.list.listContainer)
     if (!listContainer) {
-      // 列表容器未找到：可能是页面尚未加载完成，1 秒后重试一次
-      setTimeout(() => {
-        const retryContainer = document.querySelector(BOSS_SELECTORS.list.listContainer)
-        if (retryContainer) {
-          this.setupListObserver(onJobsExtracted)
-        }
-      }, 1000)
+      if (retryCount >= BossAdapter.LIST_CONTAINER_MAX_RETRY) {
+        remoteLog('info', '[diag] listContainer give up', { ts: diagTs, retryCount })
+        console.warn(
+          `[BossAdapter] .rec-job-list 未找到，已重试 ${retryCount} 次，放弃监听列表变化`,
+        )
+        return
+      }
+      remoteLog('info', '[diag] listContainer not found, retry', {
+        ts: diagTs,
+        retryCount,
+        maxRetry: BossAdapter.LIST_CONTAINER_MAX_RETRY,
+      })
+      // 持续重试，直到找到容器或达到上限
+      const timer = setTimeout(() => {
+        // 定时器触发后从集合中移除（已经执行）
+        this.listRetryTimers = this.listRetryTimers.filter((t) => t !== timer)
+        this.setupListObserver(onJobsExtracted, retryCount + 1)
+      }, BossAdapter.LIST_CONTAINER_RETRY_INTERVAL)
+      this.listRetryTimers.push(timer)
       return
     }
 
+    // 临时诊断代码：记录 listContainer 找到时的 jobCard 数量（关键指标）
+    // jobCardCount=0 说明 jobCard 还没渲染；>0 说明已渲染，observer 挂载时岗位已在 DOM 里
+    const jobCardCount = listContainer.querySelectorAll(BOSS_SELECTORS.list.jobCard).length
+    remoteLog('info', '[diag] listContainer found', { ts: diagTs, jobCardCount })
+
+    // 临时诊断代码：记录 MutationObserver 首次触发时间（只在首次触发时打日志，避免刷屏）
+    let mutationFired = false
     this.listObserver = new MutationObserver(() => {
+      if (!mutationFired) {
+        mutationFired = true
+        const currentCount = listContainer.querySelectorAll(BOSS_SELECTORS.list.jobCard).length
+        remoteLog('info', '[diag] mutation fired', { ts: Date.now(), jobCardCount: currentCount })
+      }
       // 防抖：页面渲染过程中可能触发多次 mutation，500ms 内只提取一次
       if (this.listDebounceTimer) {
         clearTimeout(this.listDebounceTimer)
@@ -349,10 +397,25 @@ export class BossAdapter {
     })
 
     // 监听子节点增删（滚动加载新卡片）
+    // subtree: true 因为卡片是 listContainer 的后代（不是直接子节点），
+    // 滚动加载往深层容器追加卡片，subtree: false 监听不到
     this.listObserver.observe(listContainer, {
       childList: true,
-      subtree: false,
+      subtree: true,
     })
+    // 临时诊断代码：记录 observer 挂载完成
+    remoteLog('info', '[diag] observer mounted', { ts: Date.now(), jobCardCount })
+
+    // 关键修复：observer 挂载时如果已有 jobCard，立即提取一次
+    // 场景：DOM fallback 在页面未就绪时运行（0 个卡片），之后 observer 挂载时
+    // 卡片已在 DOM 中，但 MutationObserver 只在变化时触发，已存在的卡片不会触发 mutation
+    if (jobCardCount > 0) {
+      remoteLog('info', `[diag] observer mounted with ${jobCardCount} existing cards, extracting immediately`)
+      const jobs = this.extractJobs()
+      if (jobs.length > 0) {
+        onJobsExtracted(jobs)
+      }
+    }
   }
 
   /**

@@ -32,14 +32,20 @@ import {
 import {
   setAccessToken,
   setBackendUrl,
+  setCurrentUser,
   getAccessToken,
-  getBackendUrl,
   fetchBackend,
   BackendError,
   AuthExpiredError,
+  initSession,
+  getSessionState,
+  resetSessionPromises,
+  clearAuthStateFromStorage,
+  clearMemoryToken,
+  type SessionState,
 } from './backend_client'
-import { bulkSet, getJobId } from './source_url_map'
-import { startPolling } from './task_poller'
+import { bulkSet, getJobId, clear as clearSourceUrlMap } from './source_url_map'
+import { startPolling, stopAllPolling } from './task_poller'
 import { ensureBossContentScriptInjected } from './interceptor_injector'
 import {
   toJobCreateRequest,
@@ -129,13 +135,22 @@ function broadcastToSidePanel<T extends ChromeMessageType>(
 async function handleAuthTokenUpdated(
   payload: ChromeMessagePayloadMap[typeof ChromeMessageType.AUTH_TOKEN_UPDATED],
 ): Promise<ChromeMessageResponse> {
-  setAccessToken(payload.accessToken)
+  setAccessToken(payload.accessToken, payload.expiresIn, payload.user ?? null)
   setBackendUrl(payload.backendUrl)
+  setCurrentUser(payload.user ?? null)
+
+  // 登出时同步清除持久化 backendUrl，避免下次 SW 启动时错误地尝试 refresh
+  if (!payload.accessToken) {
+    await clearAuthStateFromStorage()
+  }
+
   console.log(
     '[SW] token updated | user=',
     payload.user?.email ?? '(unknown)',
     '| backend=',
     payload.backendUrl,
+    '| expiresIn=',
+    payload.expiresIn ?? '(not provided)',
   )
   return { ok: true }
 }
@@ -173,6 +188,11 @@ async function handleJobsExtracted(
   console.log(
     `[SW] JOBS_EXTRACTED | pageUrl=${pageUrl} | count=${rawJobs.length}`,
   )
+
+  // 等待 SW 启动时的静默刷新完成，避免 SW 被 Chrome 回收后 token 丢失导致 401
+  // 典型场景：用户滚动页面触发懒加载 → DOM observer 捕获新岗位 → 发送 JOBS_EXTRACTED
+  // → SW 唤醒但 accessToken=null → 不带 Authorization 头 → 后端返回 401
+  await initSession()
 
   // 检查登录态：未登录直接返回错误，避免后端 401 风暴
   if (!getAccessToken()) {
@@ -621,6 +641,103 @@ function isBossListPage(url: string | undefined): boolean {
 }
 
 /**
+ * LOG handler
+ *
+ * 接收 Content Script / Service Worker / SidePanel 发送的运行时日志，
+ * 批量 POST 到 /api/extension/logs，由后端统一输出到终端。
+ */
+async function handleLog(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.LOG],
+): Promise<ChromeMessageResponse> {
+  // 等待 SW 启动时的静默刷新完成，避免 token 尚未就绪就发日志导致 401
+  await initSession()
+
+  try {
+    await fetchBackend('/api/extension/logs', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+    return { ok: true }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    console.warn('[SW] LOG handler failed:', errorMsg)
+    return { ok: false, error: errorMsg }
+  }
+}
+
+/**
+ * CLEAR_TOKEN_CACHE handler
+ *
+ * 登出时由 Popup 调用：清空 SW 内存中的 token 缓存。
+ * Popup 负责先清 chrome.storage.local，再发此消息。
+ */
+async function handleClearTokenCache(): Promise<ChromeMessageResponse> {
+  clearMemoryToken()
+  return { ok: true }
+}
+
+/**
+ * RESET_EXTRACTION_STATE handler
+ *
+ * SidePanel 重新打开 / 登出后重新登录时触发：
+ * 1. 停止所有 task_poller 轮询
+ * 2. 清空 source_url_map 内存与持久化映射
+ * 3. 重置 backend_client 并发 promise 缓存
+ * 4. 如需清空 sidepanel_state（登出场景）
+ * 5. 向当前激活 Tab 的 Content Script 转发重置消息，让 CS 清空 apiDataCaptured / sentJobTracker
+ */
+async function handleResetExtractionState(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESET_EXTRACTION_STATE],
+): Promise<ChromeMessageResponse> {
+  // 1. 停止所有异步任务轮询（避免旧账号/旧会话的轮询继续）
+  stopAllPolling()
+
+  // 2. 清空 source_url → jobId 映射
+  try {
+    await clearSourceUrlMap()
+  } catch (err) {
+    console.warn('[SW] 清空 source_url_map 失败:', err)
+  }
+
+  // 3. 重置 initSession / refresh 的并发 promise 缓存
+  resetSessionPromises()
+
+  // 4. 如需清空 SidePanel 持久化状态（登出场景）
+  if (payload.clearSidePanelStorage) {
+    try {
+      await chrome.storage.local.remove('sidepanel_state')
+    } catch (err) {
+      console.warn('[SW] 清空 sidepanel_state 失败:', err)
+    }
+  }
+
+  // 5. 转发给当前激活 Tab 的 Content Script
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id) {
+        resolve({ ok: true })
+        return
+      }
+
+      console.log('[SW] RESET_EXTRACTION_STATE | tabId=', tab.id, '| url=', tab.url)
+
+      void sendMessageToTab(tab.id, ChromeMessageType.RESET_EXTRACTION_STATE, {})
+        .then((resp) => resolve(resp))
+        .catch((err: unknown) => {
+          console.warn('[SW] 转发 RESET_EXTRACTION_STATE 到 Content Script 失败:', err)
+          resolve({ ok: false, error: err instanceof Error ? err.message : String(err) })
+        })
+    })
+  })
+}
+
+/**
  * REFRESH_JOBS handler
  *
  * SidePanel 手动刷新时触发：
@@ -766,7 +883,10 @@ export function initMessageRouter(): () => void {
     handleRecordApplication,
   )
   registerHandler(ChromeMessageType.REFRESH_JOBS, handleRefreshJobs)
+  registerHandler(ChromeMessageType.RESET_EXTRACTION_STATE, handleResetExtractionState)
+  registerHandler(ChromeMessageType.CLEAR_TOKEN_CACHE, handleClearTokenCache)
   registerHandler(ChromeMessageType.LOAD_JOB_DETAIL, handleLoadJobDetail)
+  registerHandler(ChromeMessageType.LOG, handleLog)
 
   // 注册 chrome.runtime.onMessage 监听
   const listener = (
@@ -776,8 +896,16 @@ export function initMessageRouter(): () => void {
   ) => {
     // 内部查询消息：GET_SW_STATE（不走 ChromeMessageType，用于 SidePanel 启动时查询登录态）
     if (message.type === 'GET_SW_STATE') {
-      sendResponse({ ok: true, data: getSwState() })
-      return false
+      // 先等待 SW 启动时的静默刷新完成，再返回最终状态；带 5 秒超时避免阻塞。
+      getSwState()
+        .then((state) => sendResponse({ ok: true, data: state }))
+        .catch((err: unknown) =>
+          sendResponse({
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        )
+      return true
     }
 
     const handler = handlers.get(message.type as ChromeMessageType)
@@ -811,14 +939,45 @@ export function initMessageRouter(): () => void {
   return () => chrome.runtime.onMessage.removeListener(listener)
 }
 
+/** SW 状态查询返回类型 */
+export interface SwState {
+  /** 是否已通过静默刷新或登录持有有效 access_token */
+  hasToken: boolean
+  /** 当前后端 base URL */
+  backendUrl: string
+  /** 当前登录用户信息（未登录时为 null） */
+  user: SessionState['user']
+}
+
 /**
- * 获取当前 SW 状态（供 SidePanel 检查登录态）
+ * 获取当前 SW 状态（供 SidePanel/Popup 检查登录态）
  *
- * SidePanel 启动时调用此函数，判断是否需要提示用户登录
+ * SidePanel 启动时调用此函数，判断是否需要提示用户登录。
+ * 本函数会先等待 SW 启动时的 initSession() 完成，避免在静默刷新过程中
+ * 返回「未登录」的临时状态。
  */
-export function getSwState() {
+export async function getSwState(): Promise<SwState> {
+  const SESSION_INIT_TIMEOUT_MS = 5000
+
+  try {
+    await Promise.race([
+      initSession(),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('等待 SW 会话初始化超时')),
+          SESSION_INIT_TIMEOUT_MS,
+        ),
+      ),
+    ])
+  } catch (err) {
+    console.warn('[router] 等待会话初始化失败:', err)
+    // 超时或初始化异常时返回当前已知状态，不让 UI 无限等待
+  }
+
+  const state = getSessionState()
   return {
-    hasToken: getAccessToken() !== null,
-    backendUrl: getBackendUrl(),
+    hasToken: state.isLoggedIn,
+    backendUrl: state.backendUrl,
+    user: state.user,
   }
 }
