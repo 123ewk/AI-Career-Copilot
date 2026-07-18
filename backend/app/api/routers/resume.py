@@ -361,6 +361,91 @@ async def get_resume(
     )
 
 
+# ==================== 端点：切换活跃简历 ====================
+
+
+@router.post(
+    "/{resume_id}/set-active",
+    response_model=ResumeResponse,
+    summary="切换活跃简历",
+    description=(
+        "将指定简历设为当前用户的活跃简历。\n\n"
+        "- 同一用户同一时间只能有一份活跃简历\n"
+        "- 切换后旧活跃简历自动取消\n"
+        "- 不存在或无权访问返回 404（防枚举）\n"
+        "- 用于匹配 / 沟通等场景自动选取活跃简历"
+    ),
+    responses={
+        401: {
+            "description": "缺少或无效的认证凭证",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error_code": "AUTH_001",
+                        "detail": "认证失败,请重新登录",
+                        "request_id": "req-xxxxxxxx",
+                    },
+                },
+            },
+        },
+        404: {
+            "description": "简历不存在或不属于当前用户",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error_code": "RES_001",
+                        "detail": "简历 xxx 不存在或无权访问",
+                        "request_id": "req-xxxxxxxx",
+                    },
+                },
+            },
+        },
+    },
+)
+async def set_active_resume(
+    request: Request,
+    resume_id: uuid.UUID = Path(
+        ...,
+        description="简历 UUID v4",
+    ),
+    db: AsyncSession = Depends(get_db_session),
+) -> ResumeResponse:
+    """切换活跃简历端点
+
+    流程：
+    1. 提取 user_id
+    2. Path 校验 resume_id 必须是合法 UUID（FastAPI 自动）
+    3. 调 ResumeService.set_active_resume（带 user_id 防越权）
+    4. 返回 200 + ResumeResponse（is_active=True）
+
+    Args:
+        request: FastAPI 请求对象
+        resume_id: 简历 UUID（Path 校验）
+        db: 请求级 AsyncSession
+
+    Returns:
+        ResumeResponse: 切换后的活跃简历（is_active=True）
+
+    Raises:
+        ResourceNotFoundError: 简历不存在或不属于当前用户（中间件转 404）
+    """
+    user_id = _get_current_user_id(request)
+
+    service = ResumeService(db)
+    response = await service.set_active_resume(
+        user_id=user_id,
+        resume_id=resume_id,
+    )
+
+    logger.info(
+        "切换活跃简历端点 | user_id={} | resume_id={}",
+        user_id,
+        resume_id,
+    )
+
+    return response
+
+
 # ==================== 端点：删除 ====================
 
 @router.delete(

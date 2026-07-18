@@ -265,7 +265,7 @@ function isTokenExpired(expiresAt: number | null): boolean {
  *
  * @returns 有效的 access_token 字符串，或 null（未登录/已过期）
  */
-async function getValidToken(): Promise<string | null> {
+export async function getValidToken(): Promise<string | null> {
   try {
     const stored = await loadAuthStateFromStorage()
     if (!stored?.accessToken) {

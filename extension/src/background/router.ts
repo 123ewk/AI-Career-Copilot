@@ -34,6 +34,8 @@ import {
   setBackendUrl,
   setCurrentUser,
   getAccessToken,
+  getBackendUrl,
+  getValidToken,
   fetchBackend,
   BackendError,
   AuthExpiredError,
@@ -45,6 +47,21 @@ import {
   type SessionState,
 } from './backend_client'
 import { bulkSet, getJobId, clear as clearSourceUrlMap } from './source_url_map'
+
+// ==================== JOBS_EXTRACTED 并发锁 ====================
+
+/**
+ * JOBS_EXTRACTED 串行队列锁
+ *
+ * 问题：Content Script 可能在短时间内多次发送 JOBS_EXTRACTED（DOM observer + 手动刷新），
+ * 每个消息都会启动独立的 handleJobsExtracted，导致并发 POST 风暴触发后端限流。
+ *
+ * 解决：用 Promise 链串行化所有 JOBS_EXTRACTED 处理，同一时刻只有一个在执行。
+ */
+let jobsExtractQueue: Promise<void> = Promise.resolve()
+
+/** 请求间隔（ms），60 req/min = 1 req/sec，留 20% 余量 */
+const REQUEST_INTERVAL_MS = 1200
 import { startPolling, stopAllPolling } from './task_poller'
 import { ensureBossContentScriptInjected } from './interceptor_injector'
 import {
@@ -180,9 +197,21 @@ async function handleAuthTokenUpdated(
 async function handleJobsExtracted(
   payload: ChromeMessagePayloadMap[typeof ChromeMessageType.JOBS_EXTRACTED],
 ): Promise<ChromeMessageResponse> {
+  // 排队等待：确保同一时刻只有一个 JOBS_EXTRACTED handler 在执行
+  // 避免多次触发导致并发 POST 风暴
+  const result = new Promise<ChromeMessageResponse>((resolve) => {
+    jobsExtractQueue = jobsExtractQueue.then(() =>
+      doHandleJobsExtracted(payload).then(resolve),
+    )
+  })
+  return result
+}
+
+/** 实际的 JOBS_EXTRACTED 处理逻辑（被队列锁保护） */
+async function doHandleJobsExtracted(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.JOBS_EXTRACTED],
+): Promise<ChromeMessageResponse> {
   const { pageUrl, jobs } = payload
-  // payload.jobs 类型为 unknown[]，断言为 RawBossJob[]
-  // Content Script 通过 sendMessageToBackground 发送，类型由协议保证
   const rawJobs = jobs as RawBossJob[]
 
   console.log(
@@ -190,8 +219,6 @@ async function handleJobsExtracted(
   )
 
   // 等待 SW 启动时的静默刷新完成，避免 SW 被 Chrome 回收后 token 丢失导致 401
-  // 典型场景：用户滚动页面触发懒加载 → DOM observer 捕获新岗位 → 发送 JOBS_EXTRACTED
-  // → SW 唤醒但 accessToken=null → 不带 Authorization 头 → 后端返回 401
   await initSession()
 
   // 检查登录态：未登录直接返回错误，避免后端 401 风暴
@@ -202,8 +229,14 @@ async function handleJobsExtracted(
   const created: ChromeMessagePayloadMap[typeof ChromeMessageType.JOBS_CREATED]['created'] = []
   const failed: ChromeMessagePayloadMap[typeof ChromeMessageType.JOBS_CREATED]['failed'] = []
 
-  // 串行创建：每个 job 转换 → POST → 收集结果
-  for (const raw of rawJobs) {
+  // 串行创建 + 请求间隔控制，避免触发后端 60 req/min 限流
+  for (let i = 0; i < rawJobs.length; i++) {
+    // 非首个请求前等待间隔（60 req/min ≈ 1 req/sec，留 20% 余量）
+    if (i > 0) {
+      await new Promise((r) => setTimeout(r, REQUEST_INTERVAL_MS))
+    }
+
+    const raw = rawJobs[i]
     const req: JobCreateRequest = toJobCreateRequest(raw)
     try {
       const resp = await fetchBackend<JobResponse>('/api/jobs/', {
@@ -854,6 +887,167 @@ async function handleLoadJobDetail(
   })
 }
 
+// ==================== 简历 Handlers ====================
+
+async function handleResumeUpload(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESUME_UPLOAD],
+): Promise<ChromeMessageResponse> {
+  const { filename, mimeType, fileData } = payload
+
+  // fileData 是 number[] 格式（避免 ArrayBuffer 在消息传递中被转为普通对象）
+  // 重建为 Uint8Array 用于构建 Blob
+  const uint8 = new Uint8Array(fileData)
+  console.log(`[SW] RESUME_UPLOAD | filename=${filename} | mime=${mimeType} | size=${uint8.byteLength}`)
+
+  await initSession()
+
+  // 上传不能用 fetchBackend（它强制 Content-Type: application/json）
+  // 手动构建 FormData + raw fetch
+  const token = await getValidToken()
+  if (!token) {
+    return { ok: false, error: '未登录，请先登录' }
+  }
+
+  const blob = new Blob([uint8], { type: mimeType })
+  const formData = new FormData()
+  formData.append('file', blob, filename)
+
+  const backendUrl = getBackendUrl()
+
+  try {
+    let resp = await fetch(`${backendUrl}/api/resumes/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: formData,
+      credentials: 'include',
+    })
+
+    // 401 重试一次（与 fetchBackend 逻辑一致）
+    if (resp.status === 401) {
+      console.warn('[SW] RESUME_UPLOAD 收到 401，尝试 refresh')
+      await initSession()
+      const newToken = await getValidToken()
+      if (!newToken) {
+        return { ok: false, error: '登录已过期，请重新登录' }
+      }
+      resp = await fetch(`${backendUrl}/api/resumes/upload`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${newToken}` },
+        body: formData,
+        credentials: 'include',
+      })
+    }
+
+    if (!resp.ok) {
+      const errText = await resp.text()
+      let detail = `上传失败 (${resp.status})`
+      try {
+        const errJson = JSON.parse(errText)
+        detail = errJson.detail ?? detail
+      } catch { /* 用默认消息 */ }
+      return { ok: false, error: detail }
+    }
+
+    const data = await resp.json()
+    console.log(`[SW] RESUME_UPLOAD 成功 | resumeId=${data.resume?.id}`)
+    return { ok: true, data }
+  } catch (err) {
+    return { ok: false, error: `网络错误：${err instanceof Error ? err.message : String(err)}` }
+  }
+}
+
+async function handleResumeList(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESUME_LIST],
+): Promise<ChromeMessageResponse> {
+  const { limit, offset } = payload
+
+  console.log(`[SW] RESUME_LIST | limit=${limit ?? 20} | offset=${offset ?? 0}`)
+
+  try {
+    const params = new URLSearchParams()
+    if (limit !== undefined) params.set('limit', String(limit))
+    if (offset !== undefined) params.set('offset', String(offset))
+    const qs = params.toString()
+    const path = `/api/resumes/${qs ? `?${qs}` : ''}`
+
+    const data = await fetchBackend(path)
+    return { ok: true, data }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    return { ok: false, error: `获取简历列表失败：${errorMsg}` }
+  }
+}
+
+async function handleResumeGet(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESUME_GET],
+): Promise<ChromeMessageResponse> {
+  const { resumeId } = payload
+
+  console.log(`[SW] RESUME_GET | resumeId=${resumeId}`)
+
+  try {
+    const data = await fetchBackend(`/api/resumes/${resumeId}`)
+    return { ok: true, data }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    return { ok: false, error: `获取简历详情失败：${errorMsg}` }
+  }
+}
+
+async function handleResumeSetActive(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESUME_SET_ACTIVE],
+): Promise<ChromeMessageResponse> {
+  const { resumeId } = payload
+
+  console.log(`[SW] RESUME_SET_ACTIVE | resumeId=${resumeId}`)
+
+  try {
+    const data = await fetchBackend(`/api/resumes/${resumeId}/set-active`, {
+      method: 'POST',
+    })
+    return { ok: true, data }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    return { ok: false, error: `切换活跃简历失败：${errorMsg}` }
+  }
+}
+
+async function handleResumeDelete(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESUME_DELETE],
+): Promise<ChromeMessageResponse> {
+  const { resumeId } = payload
+
+  console.log(`[SW] RESUME_DELETE | resumeId=${resumeId}`)
+
+  try {
+    await fetchBackend(`/api/resumes/${resumeId}`, { method: 'DELETE' })
+    return { ok: true }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    return { ok: false, error: `删除简历失败：${errorMsg}` }
+  }
+}
+
 // ==================== 路由初始化 ====================
 
 /**
@@ -887,6 +1081,11 @@ export function initMessageRouter(): () => void {
   registerHandler(ChromeMessageType.CLEAR_TOKEN_CACHE, handleClearTokenCache)
   registerHandler(ChromeMessageType.LOAD_JOB_DETAIL, handleLoadJobDetail)
   registerHandler(ChromeMessageType.LOG, handleLog)
+  registerHandler(ChromeMessageType.RESUME_UPLOAD, handleResumeUpload)
+  registerHandler(ChromeMessageType.RESUME_LIST, handleResumeList)
+  registerHandler(ChromeMessageType.RESUME_GET, handleResumeGet)
+  registerHandler(ChromeMessageType.RESUME_SET_ACTIVE, handleResumeSetActive)
+  registerHandler(ChromeMessageType.RESUME_DELETE, handleResumeDelete)
 
   // 注册 chrome.runtime.onMessage 监听
   const listener = (

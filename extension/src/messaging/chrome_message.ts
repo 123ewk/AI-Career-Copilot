@@ -110,6 +110,21 @@ export const ChromeMessageType = {
    * 流程：Popup 先清 chrome.storage.local → 再发此消息让 SW 清内存
    */
   CLEAR_TOKEN_CACHE: "CLEAR_TOKEN_CACHE",
+
+  /** SidePanel 上传简历文件（multipart/form-data） */
+  RESUME_UPLOAD: "RESUME_UPLOAD",
+
+  /** SidePanel 请求简历列表（分页） */
+  RESUME_LIST: "RESUME_LIST",
+
+  /** SidePanel 请求简历详情 */
+  RESUME_GET: "RESUME_GET",
+
+  /** SidePanel 请求切换活跃简历 */
+  RESUME_SET_ACTIVE: "RESUME_SET_ACTIVE",
+
+  /** SidePanel 请求删除简历 */
+  RESUME_DELETE: "RESUME_DELETE",
 } as const
 
 /** 消息类型字面量联合（用于泛型约束） */
@@ -302,6 +317,37 @@ export interface ChromeMessagePayloadMap {
    * - 比 AUTH_TOKEN_UPDATED(null) 更语义化：专门用于清缓存，不涉及 backendUrl 等其他状态
    */
   [ChromeMessageType.CLEAR_TOKEN_CACHE]: Record<string, never>
+
+  [ChromeMessageType.RESUME_UPLOAD]: {
+    /** 原始文件名 */
+    filename: string
+    /** MIME 类型 */
+    mimeType: string
+    /** 文件字节（number[] 格式，避免 ArrayBuffer 在消息传递中被转为普通对象） */
+    fileData: number[]
+  }
+
+  [ChromeMessageType.RESUME_LIST]: {
+    /** 每页大小（1-100，默认 20） */
+    limit?: number
+    /** 偏移量（默认 0） */
+    offset?: number
+  }
+
+  [ChromeMessageType.RESUME_GET]: {
+    /** 简历 UUID */
+    resumeId: string
+  }
+
+  [ChromeMessageType.RESUME_SET_ACTIVE]: {
+    /** 简历 UUID */
+    resumeId: string
+  }
+
+  [ChromeMessageType.RESUME_DELETE]: {
+    /** 简历 UUID */
+    resumeId: string
+  }
 }
 
 /** 通用消息结构 */

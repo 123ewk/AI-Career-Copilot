@@ -244,6 +244,10 @@ class ResumeService:
             )
             raise
 
+        # ---- 2.5 清洗非法字符 ----
+        # PDF 解析经常产生 NUL 字节(\x00),PostgreSQL UTF-8 编码不允许存储
+        raw_text = raw_text.replace('\x00', '')
+
         # ---- 3. 解析后文本长度校验 ----
         # 防御:恶意 PDF 可能内嵌 JS / 大量重复内容,解析后文本膨胀
         # 即使 DTO 层有 max_length,Service 层也做兜底(深度防御)

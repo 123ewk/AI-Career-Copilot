@@ -18,6 +18,7 @@
 import { onMounted, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useSidePanelStore } from './stores/sidepanel'
+import { useResumeStore } from './stores/resume'
 import {
   onMessage,
   ChromeMessageType,
@@ -29,8 +30,10 @@ import TabNav from './components/sidepanel/TabNav.vue'
 import JobListPanel from './components/sidepanel/JobListPanel.vue'
 import JobDetailPanel from './components/sidepanel/JobDetailPanel.vue'
 import LoginPanel from './components/LoginPanel.vue'
+import ResumeTab from './components/sidepanel/ResumeTab.vue'
 
 const store = useSidePanelStore()
+const resumeStore = useResumeStore()
 const { status, backendHealth, isBossListPage, jobs, userInfo, errorMessage, activeTab, selectedJob } =
   storeToRefs(store)
 const { loadFromStorage } = store
@@ -299,6 +302,7 @@ onMounted(async () => {
 
   // 优先从 chrome.storage.local 恢复上次状态（岗位列表、分析结果、投递记录等）
   await loadFromStorage()
+  await resumeStore.loadFromStorage()
 
   // 设置当前页 URL
   const currentTab = await getCurrentTab()
@@ -429,7 +433,12 @@ async function handleRefresh() {
       </div>
     </div>
 
-    <!-- 其他 Tab 占位（Step 5 未实现） -->
+    <!-- 已就绪：简历 Tab 内容 -->
+    <div v-else-if="status === 'ready' && activeTab === 'resume'" class="resume-tab-wrapper">
+      <ResumeTab />
+    </div>
+
+    <!-- 其他 Tab 占位（沟通/设置未实现） -->
     <div v-else-if="status === 'ready'" class="status-view placeholder-tab">
       <div class="status-icon">🚧</div>
       <h2 class="status-title">正在开发中</h2>
@@ -628,6 +637,15 @@ async function handleRefresh() {
 /* ==================== 岗位 Tab 左右分栏 ==================== */
 
 .job-tab-content {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ==================== 简历 Tab 左右分栏 ==================== */
+
+.resume-tab-wrapper {
   flex: 1;
   display: flex;
   min-height: 0;

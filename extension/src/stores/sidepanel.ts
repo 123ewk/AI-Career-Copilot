@@ -508,7 +508,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
    * v2 → v3:移除 DOM 列表 fallback,改为纯 API 拦截。v2 持久化的 salaryRaw
    * 可能为字体反爬乱码,强制丢弃。
    */
-  const STORAGE_VERSION = 3
+  const STORAGE_VERSION = 4
 
   /** 需要持久化的状态快照 */
   interface PersistedState {

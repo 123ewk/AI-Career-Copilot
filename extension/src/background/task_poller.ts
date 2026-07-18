@@ -39,7 +39,7 @@ export interface PollOptions {
   jobId: string
   /** 轮询间隔（毫秒），默认 2000 */
   intervalMs?: number
-  /** 最大尝试次数，默认 30（30 × 2s = 60s 超时） */
+  /** 最大尝试次数，默认 90（90 × 2s = 180s 超时，LLM 调用可达 60s + MQ 排队 + Web 搜索） */
   maxAttempts?: number
   /** 任务完成（COMPLETED）回调，参数为后端返回的 result 字段 */
   onComplete: (result: unknown) => void
@@ -87,7 +87,7 @@ export function startPolling(options: PollOptions): void {
     taskType,
     jobId,
     intervalMs = 2000,
-    maxAttempts = 30,
+    maxAttempts = 90,
     onComplete,
     onError,
   } = options

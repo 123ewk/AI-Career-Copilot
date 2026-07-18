@@ -22,7 +22,7 @@ interface TabItem {
 const tabs: TabItem[] = [
   { key: 'jobs', label: '岗位', enabled: true },
   { key: 'chat', label: '沟通', enabled: false },
-  { key: 'resume', label: '简历', enabled: false },
+  { key: 'resume', label: '简历', enabled: true },
   { key: 'settings', label: '设置', enabled: false },
 ]
 
