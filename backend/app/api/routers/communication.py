@@ -7,6 +7,7 @@
 
 端点：
 - POST /generate: 异步生成沟通话术，返回 task_id
+- POST /reply: 同步生成多轮对话回复（用户在聊天中等待）
 """
 
 import uuid
@@ -19,6 +20,8 @@ from app.core.logger import logger
 from app.domain.communication.models import (
     CommunicationGenerateRequest,
     CommunicationGenerateResponse,
+    ConversationContextRequest,
+    ConversationReplyResponse,
 )
 from app.domain.communication.service import CommunicationService
 from app.infra.database.postgres import get_db_session
@@ -99,6 +102,53 @@ async def generate_communication(
         task_id=task_info["task_id"],
         status=task_info["status"],
     )
+
+
+# ==================== 端点：多轮对话回复 ====================
+
+
+@router.post(
+    "/reply",
+    response_model=ConversationReplyResponse,
+    status_code=status.HTTP_200_OK,
+    summary="生成对话回复（同步）",
+    description=(
+        "基于对话历史 + 岗位 + 简历，同步生成 AI 建议回复。\n\n"
+        "- 200 OK：直接返回 suggested_reply\n"
+        "- 用户在聊天中主动等待，LLM 调用约 2s\n"
+        "- 若未传 resume_id，使用用户当前活跃简历"
+    ),
+)
+async def generate_reply(
+    request: Request,
+    body: ConversationContextRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> ConversationReplyResponse:
+    """同步生成多轮对话回复
+
+    设计理由：
+    - 用户在聊天中主动等待，需即时响应（~2s）
+    - LLM 调用约 2 秒，同步可接受
+    - 不走 MQ 异步，直接返回 suggested_reply
+    """
+    user_id = uuid.UUID(request.state.user_id)
+    logger.info(
+        "生成对话回复端点 | user_id={} | recruiter={} | message_count={}",
+        user_id,
+        body.recruiter_name,
+        len(body.messages),
+    )
+
+    service = CommunicationService(db)
+    try:
+        result = await service.generate_reply(
+            user_id=user_id,
+            request=body,
+        )
+    finally:
+        await service.close()
+
+    return result
 
 
 __all__ = ["router"]

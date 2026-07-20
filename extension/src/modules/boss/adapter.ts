@@ -49,7 +49,7 @@ import { remoteLog } from '../../logging/remote_logger'
  * - detail：单个岗位详情页（zhipin.com/job_detail/*）
  * - unknown：非 Boss 页面
  */
-export type BossPageType = 'list' | 'detail' | 'unknown'
+export type BossPageType = 'list' | 'detail' | 'chat' | 'unknown'
 
 /**
  * 页面检测结果
@@ -61,6 +61,8 @@ export interface BossPageInfo {
   url: string
   /** 是否为列表页（type === 'list'） */
   isListPage: boolean
+  /** 是否为聊天页（type === 'chat'） */
+  isChatPage: boolean
 }
 
 /**
@@ -74,7 +76,7 @@ export interface BossAdapterCallbacks {
   /** 详情面板加载完成（用户点击卡片后触发） */
   onDetailExtracted?: (detail: Partial<RawBossJob>) => void
   /** URL 变化（SPA 路由切换、搜索条件变化） */
-  onUrlChanged?: (url: string, isListPage: boolean) => void
+  onUrlChanged?: (url: string, isListPage: boolean, isChatPage: boolean) => void
 }
 
 /** MutationObserver 防抖延迟（ms），避免页面渲染过程中频繁触发 */
@@ -134,12 +136,15 @@ export class BossAdapter {
     const isListPage = url.includes('zhipin.com/web/geek/jobs')
     // 详情页：包含 /job_detail/ 路径
     const isDetailPage = url.includes('zhipin.com/job_detail/')
+    // 聊天页：包含 /web/geek/chat 路径
+    const isChatPage = url.includes('zhipin.com/web/geek/chat')
 
     let type: BossPageType = 'unknown'
     if (isListPage) type = 'list'
     else if (isDetailPage) type = 'detail'
+    else if (isChatPage) type = 'chat'
 
-    return { type, url, isListPage }
+    return { type, url, isListPage, isChatPage }
   }
 
   /**
@@ -470,13 +475,13 @@ private setupListObserver(
    * - 侵入性强，可能影响页面原有逻辑
    * - Boss 直聘可能已覆写 pushState，劫持会破坏其功能
    */
-  private setupUrlPolling(onUrlChanged: (url: string, isListPage: boolean) => void): void {
+  private setupUrlPolling(onUrlChanged: (url: string, isListPage: boolean, isChatPage: boolean) => void): void {
     this.urlPollTimer = setInterval(() => {
       const currentUrl = location.href
       if (currentUrl !== this.lastUrl) {
         this.lastUrl = currentUrl
         const info = this.detect()
-        onUrlChanged(info.url, info.isListPage)
+        onUrlChanged(info.url, info.isListPage, info.isChatPage)
       }
     }, URL_POLL_INTERVAL_MS)
   }

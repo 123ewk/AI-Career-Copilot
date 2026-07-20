@@ -13,6 +13,7 @@
 
 from app.infra.database.models.agent_memory import AgentMemory, EMBEDDING_DIMENSIONS, MemoryType
 from app.infra.database.models.application import Application, ApplicationStatus
+from app.infra.database.models.conversation import Conversation
 from app.infra.database.models.job import Job
 from app.infra.database.models.resume import Resume
 from app.infra.database.models.session import Session, SessionStatus
@@ -23,6 +24,7 @@ __all__ = [
     "AgentMemory",
     "Application",
     "ApplicationStatus",
+    "Conversation",
     "EMBEDDING_DIMENSIONS",
     "Job",
     "MemoryType",

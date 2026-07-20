@@ -19,6 +19,7 @@ import { onMounted, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useSidePanelStore } from './stores/sidepanel'
 import { useResumeStore } from './stores/resume'
+import { useCommunicationStore } from './stores/communication'
 import {
   onMessage,
   ChromeMessageType,
@@ -31,9 +32,11 @@ import JobListPanel from './components/sidepanel/JobListPanel.vue'
 import JobDetailPanel from './components/sidepanel/JobDetailPanel.vue'
 import LoginPanel from './components/LoginPanel.vue'
 import ResumeTab from './components/sidepanel/ResumeTab.vue'
+import ChatTab from './components/sidepanel/ChatTab.vue'
 
 const store = useSidePanelStore()
 const resumeStore = useResumeStore()
+const commStore = useCommunicationStore()
 const { status, backendHealth, isBossListPage, jobs, userInfo, errorMessage, activeTab, selectedJob } =
   storeToRefs(store)
 const { loadFromStorage } = store
@@ -244,6 +247,17 @@ function registerMessageListeners() {
         const payload = message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.PAGE_CHANGED]
         const pageChanged = store.currentUrl !== payload.url
         store.setPageInfo(payload.url, payload.isBossListPage)
+        // 检测是否为聊天页
+        const isChatPage = payload.url.includes('zhipin.com/web/geek/chat')
+        commStore.setOnChatPage(isChatPage)
+        // 设置活跃页面类型
+        if (payload.isBossListPage) {
+          store.setActivePage('list')
+        } else if (isChatPage) {
+          store.setActivePage('chat')
+        } else {
+          store.setActivePage('other')
+        }
         // 页面 URL 发生变化时清空旧岗位列表，等待新的 JOBS_CREATED 替换
         if (pageChanged) {
           store.clearJobs()
@@ -273,6 +287,33 @@ function registerMessageListeners() {
           message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.JOB_DETAIL_PATCHED]
         console.log(`[App] JOB_DETAIL_PATCHED | jobId=${payload.jobId} | hasJdText=${payload.hasJdText}`)
         store.onJobDetailPatched(payload)
+        break
+      }
+      case ChromeMessageType.CHAT_MESSAGES_UPDATED: {
+        const payload =
+          message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_MESSAGES_UPDATED]
+        console.log(
+          `[App] CHAT_MESSAGES_UPDATED | recruiter=${payload.recruiterName} | count=${payload.messages.length}`,
+        )
+        commStore.setOnChatPage(true)
+        store.setActivePage('chat')
+        commStore.updateFromExtracted(payload)
+        break
+      }
+      case ChromeMessageType.CHAT_CONVERSATION_SWITCHED: {
+        const payload =
+          message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATION_SWITCHED]
+        console.log(
+          `[App] CHAT_CONVERSATION_SWITCHED | recruiter=${payload.recruiterName}`,
+        )
+        commStore.switchConversation(payload)
+        break
+      }
+      case ChromeMessageType.CHAT_DIAGNOSE: {
+        const payload =
+          message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_DIAGNOSE]
+        console.log('[App] CHAT_DIAGNOSE received')
+        commStore.setDiagnostics(payload.diagnostics)
         break
       }
       default:
@@ -308,7 +349,12 @@ onMounted(async () => {
   const currentTab = await getCurrentTab()
   if (currentTab?.url) {
     const isBoss = currentTab.url.includes('zhipin.com/web/geek/jobs')
+    const isChat = currentTab.url.includes('zhipin.com/web/geek/chat')
     store.setPageInfo(currentTab.url, isBoss)
+    commStore.setOnChatPage(isChat)
+    if (isBoss) store.setActivePage('list')
+    else if (isChat) store.setActivePage('chat')
+    else store.setActivePage('other')
   }
 
   // 并行检查后端 + 登录态
@@ -402,7 +448,17 @@ async function handleRefresh() {
       <LoginPanel @logged-in="handleLoggedIn" />
     </div>
 
-    <!-- 等待 Boss 列表页 -->
+    <!-- 沟通 Tab：登录即可用，不依赖岗位状态 -->
+    <div v-else-if="activeTab === 'chat'" class="chat-tab-wrapper">
+      <ChatTab />
+    </div>
+
+    <!-- 简历 Tab：登录即可用，不依赖岗位状态 -->
+    <div v-else-if="activeTab === 'resume'" class="resume-tab-wrapper">
+      <ResumeTab />
+    </div>
+
+    <!-- 岗位 Tab + 等待列表页 -->
     <div v-else-if="status === 'idle'" class="status-view">
       <div class="status-icon">📋</div>
       <h2 class="status-title">等待 Boss 列表页</h2>
@@ -415,14 +471,14 @@ async function handleRefresh() {
       </div>
     </div>
 
-    <!-- 提取中 -->
+    <!-- 岗位 Tab + 提取中 -->
     <div v-else-if="status === 'extracting'" class="status-view">
       <div class="spinner" />
       <h2 class="status-title">正在提取岗位</h2>
       <p class="status-desc">已发现 {{ jobs.length }} 个岗位</p>
     </div>
 
-    <!-- 已就绪：岗位 Tab 内容 -->
+    <!-- 岗位 Tab + 已就绪 -->
     <div v-else-if="status === 'ready' && activeTab === 'jobs'" class="job-tab-content">
       <JobListPanel />
       <JobDetailPanel v-if="selectedJob" :key="selectedJob.sourceUrl" :job="selectedJob" />
@@ -433,12 +489,7 @@ async function handleRefresh() {
       </div>
     </div>
 
-    <!-- 已就绪：简历 Tab 内容 -->
-    <div v-else-if="status === 'ready' && activeTab === 'resume'" class="resume-tab-wrapper">
-      <ResumeTab />
-    </div>
-
-    <!-- 其他 Tab 占位（沟通/设置未实现） -->
+    <!-- 其他 Tab 占位（设置未实现） -->
     <div v-else-if="status === 'ready'" class="status-view placeholder-tab">
       <div class="status-icon">🚧</div>
       <h2 class="status-title">正在开发中</h2>
@@ -637,6 +688,15 @@ async function handleRefresh() {
 /* ==================== 岗位 Tab 左右分栏 ==================== */
 
 .job-tab-content {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ==================== 沟通 Tab 左右分栏 ==================== */
+
+.chat-tab-wrapper {
   flex: 1;
   display: flex;
   min-height: 0;

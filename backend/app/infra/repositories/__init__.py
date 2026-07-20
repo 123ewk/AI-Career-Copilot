@@ -31,6 +31,7 @@
 # 已实现的仓储类显式重导出,使外部 `from app.infra.repositories import XxxRepository` 可用
 from typing import Any
 
+from app.infra.repositories.conversation_repo import ConversationRepository as ConversationRepository
 from app.infra.repositories.job_repo import JobRepository as JobRepository
 from app.infra.repositories.resume_repo import ResumeRepository as ResumeRepository
 from app.infra.repositories.task_repo import TaskRepository as TaskRepository
@@ -60,6 +61,7 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "ConversationRepository",
     "JobRepository",
     "ResumeRepository",
     "SessionRepository",

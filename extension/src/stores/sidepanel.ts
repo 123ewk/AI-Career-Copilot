@@ -29,14 +29,17 @@ import type {
   CommunicationScriptResponse,
 } from '../types/job'
 
-/** SidePanel 全局 UI 状态 */
+/** SidePanel 全局 UI 状态（仅控制岗位模块） */
 export type SidePanelStatus =
   | 'loading' // 初始化中
   | 'not_logged_in' // 未登录（提示用户去 Popup 登录）
-  | 'idle' // 已登录，等待 Boss 列表页
+  | 'idle' // 已登录，等待 Boss 列表页（仅影响岗位 Tab）
   | 'extracting' // 正在提取岗位
   | 'ready' // 岗位列表已就绪
   | 'error' // 错误状态
+
+/** 当前活跃的页面类型（控制各 Tab 是否可渲染） */
+export type ActivePage = 'list' | 'chat' | 'other'
 
 /** 当前展示的岗位（Step 5 详细化） */
 export interface DisplayJob {
@@ -103,6 +106,9 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
   /** 是否为 Boss 列表页 */
   const isBossListPage = ref<boolean>(false)
 
+  /** 当前活跃页面类型（list/chat/other），控制各 Tab 可用性 */
+  const activePage = ref<ActivePage>('other')
+
   /** 提取到的岗位列表 */
   const jobs = ref<DisplayJob[]>([])
 
@@ -167,6 +173,12 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
   function setPageInfo(url: string, isBoss: boolean) {
     currentUrl.value = url
     isBossListPage.value = isBoss
+    if (isBoss) activePage.value = 'list'
+  }
+
+  /** 设置当前活跃页面（chat 页面独立设置） */
+  function setActivePage(page: ActivePage) {
+    activePage.value = page
   }
 
   /** 替换岗位列表（JOBS_EXTRACTED 消息触发） */
@@ -668,6 +680,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
     backendHealth,
     currentUrl,
     isBossListPage,
+    activePage,
     jobs,
     selectedSourceUrl,
     userInfo,
@@ -686,6 +699,7 @@ export const useSidePanelStore = defineStore('sidepanel', () => {
     setStatus,
     setBackendHealth,
     setPageInfo,
+    setActivePage,
     setJobs,
     appendJobs,
     selectJob,

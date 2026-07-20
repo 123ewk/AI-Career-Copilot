@@ -39,6 +39,7 @@ from app.api.routers import (
     applications,
     auth,
     communication,
+    conversation,
     extension_log,
     health,
     jobs,
@@ -223,6 +224,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router, prefix="/api/jobs", tags=["岗位"])
     app.include_router(match.router, prefix="/api/match", tags=["匹配"])
     app.include_router(communication.router, prefix="/api/communication", tags=["沟通话术"])
+    app.include_router(conversation.router, prefix="/api/conversations", tags=["对话历史"])
     app.include_router(applications.router, prefix="/api/applications", tags=["投递记录"])
     app.include_router(session.router, prefix="/api/sessions", tags=["会话"])
     app.include_router(task.router, prefix="/api/tasks", tags=["任务"])

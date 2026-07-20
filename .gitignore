@@ -157,6 +157,20 @@ storage/
 # Boss 页面 HTML 原始快照（调试抓取用，不提交）
 _boss_web_html/
 
+# Playwright / MCP 浏览器自动化产生的本地快照与截图
+.playwright-mcp/
+
+# 浏览器用户数据目录（含 Cookies、History、Login Data 等敏感数据）
+.chrome_user_data/
+
+# Playwright 浏览器 Profile（含会话状态、本地存储等）
+.playwright_profile/
+
+# boss_nixian/chat 本地调试产物（网页快照、资源文件、提取结果）
+boss_nixian/chat/*.html
+boss_nixian/chat/*_files/
+boss_nixian/chat/dom_result.json
+
 # 本地 PowerShell 启动脚本（含个人环境/路径）
 start.ps1
 

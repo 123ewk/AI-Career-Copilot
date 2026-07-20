@@ -31,6 +31,7 @@ Resume 域的缓存抽象（ResumeCacheProtocol）已迁出至 `app.domain.cache
 # 已实现的 Protocol 显式重导出,使外部 `from app.domain.repositories import XxxProtocol` 可用
 from typing import Any
 
+from app.domain.repositories.conversation import ConversationRepositoryProtocol as ConversationRepositoryProtocol
 from app.domain.repositories.job import JobRepositoryProtocol as JobRepositoryProtocol
 from app.domain.repositories.resume import ResumeRepositoryProtocol as ResumeRepositoryProtocol
 from app.domain.repositories.task import TaskRepositoryProtocol as TaskRepositoryProtocol

@@ -3,24 +3,32 @@
 职责：
 - 基于岗位分析结果、简历信息、匹配结果生成自然风格的沟通话术
 - 提供同步生成和异步任务封装两种能力
+- 提供多轮对话回复生成（generate_reply）和消息同步（sync_messages）
 
 设计动机：
 - 话术生成依赖 LLM，按项目规则走 MQ 异步任务
 - Prompt 必须基于简历真实信息，避免编造用户背景
 - 风格为自然实习聊天风，贴近 Boss 直聘真实沟通场景
+- 多轮对话回复走同步端点（~2s），用户在聊天中等待
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from typing import Any
 
 from app.core.exceptions import ExternalServiceError, ResourceNotFoundError
 from app.core.logger import logger
 from app.domain.communication.models import (
+    ChatMessage,
     CommunicationGenerateRequest,
     CommunicationScriptResponse,
+    ConversationContextRequest,
+    ConversationReplyResponse,
+    ConversationSyncRequest,
+    ConversationSyncResponse,
 )
 from app.domain.job.service import JobService
 from app.domain.resume.service import ResumeService
@@ -57,6 +65,43 @@ _COMMUNICATION_PROMPT_TEMPLATE: str = """你是一位正在 Boss 直聘上找实
   "full_script": "把 greeting 和 follow_up 串成一段完整参考对话"
 }}
 """
+
+
+# ==================== 多轮对话回复 Prompt ====================
+
+_REPLY_SYSTEM_PROMPT: str = """你是一个求职助手，正在帮用户在 BOSS 直聘上与招聘方沟通。
+
+你的角色：
+- 以求职者的身份回复招聘方的消息
+- 语气自然、礼貌、专业
+- 回复简洁（一般不超过 100 字）
+- 不要过度热情或卑微
+- 如果招聘方问了具体问题（如到岗时间、期望薪资），根据简历信息如实回答
+- 如果不确定某个信息，建议用户确认后再回复
+
+输出格式（JSON）：
+{{"reply": "你生成的回复文本"}}
+"""
+
+_REPLY_USER_PROMPT: str = """{job_context}
+{resume_context}
+
+=== 对话历史 ===
+{conversation_history}
+
+=== 任务 ===
+请根据以上对话历史和背景信息，生成对招聘方最新消息的回复。
+
+招聘方最新消息：{last_recruiter_message}
+
+语气风格：{tone_description}
+"""
+
+_TONE_DESCRIPTIONS: dict[str, str] = {
+    "natural": "自然随意，像正常聊天",
+    "formal": "正式商务，适合大公司",
+    "enthusiastic": "积极热情，表达强烈兴趣",
+}
 
 
 # ==================== 公共 API ====================
@@ -253,6 +298,204 @@ class CommunicationService:
             "task_id": task.id,
             "status": task.status,
         }
+
+    async def generate_reply(
+        self,
+        user_id: uuid.UUID,
+        request: ConversationContextRequest,
+    ) -> ConversationReplyResponse:
+        """同步生成多轮对话回复
+
+        用户在聊天中主动等待，需即时响应（~2s）。
+        走同步端点，不走 MQ。
+
+        Args:
+            user_id: 用户 ID
+            request: 对话上下文请求
+
+        Returns:
+            ConversationReplyResponse（含 suggested_reply）
+
+        Raises:
+            ExternalServiceError: LLM 调用失败
+        """
+        logger.info(
+            "生成对话回复 | user_id={} | recruiter={} | message_count={} | tone={}",
+            user_id,
+            request.recruiter_name,
+            len(request.messages),
+            request.tone,
+        )
+
+        # 1. 加载岗位上下文（可选）
+        job_context = ""
+        if request.job_id:
+            job = await self._job_service.get_job(job_id=request.job_id)
+            if job:
+                job_context = f"## 岗位信息\n- 岗位：{job.title}\n- 公司：{job.company}"
+                if job.jd_text:
+                    jd_preview = job.jd_text[:500] + "..." if len(job.jd_text) > 500 else job.jd_text
+                    job_context += f"\n- JD 摘要：{jd_preview}"
+
+        # 2. 加载简历上下文（可选）
+        resume_context = ""
+        resume = None
+        if request.resume_id:
+            resume = await self._resume_service.get_resume(
+                user_id=user_id, resume_id=request.resume_id
+            )
+        else:
+            resume = await self._resume_service.get_active_resume(user_id=user_id)
+        if resume:
+            resume_skills = ", ".join(resume.skills or []) if resume.skills else "无"
+            resume_context = f"## 简历信息\n- 技能：{resume_skills}"
+            if resume.raw_text:
+                resume_preview = resume.raw_text[:500] + "..." if len(resume.raw_text) > 500 else resume.raw_text
+                resume_context += f"\n- 简历摘要：{resume_preview}"
+
+        # 3. 构建对话历史
+        history_lines: list[str] = []
+        for msg in request.messages:
+            role_label = "我" if msg.role == "user" else "招聘方"
+            history_lines.append(f"{role_label}：{msg.text}")
+        conversation_history = "\n".join(history_lines)
+
+        # 4. 最后一条招聘方消息
+        last_recruiter_message = ""
+        for msg in reversed(request.messages):
+            if msg.role == "recruiter":
+                last_recruiter_message = msg.text
+                break
+
+        # 5. 构建 prompt
+        tone_desc = _TONE_DESCRIPTIONS.get(request.tone, _TONE_DESCRIPTIONS["natural"])
+        user_prompt = _REPLY_USER_PROMPT.format(
+            job_context=job_context or "（无岗位信息）",
+            resume_context=resume_context or "（无简历信息）",
+            conversation_history=conversation_history,
+            last_recruiter_message=last_recruiter_message or "（无）",
+            tone_description=tone_desc,
+        )
+
+        # 6. 调用 LLM
+        response = await self._llm.chat_completion(
+            messages=[
+                {"role": "system", "content": _REPLY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+
+        content = (
+            response.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        if not content:
+            raise ExternalServiceError(
+                detail="LLM 响应 content 为空",
+                error_code="EXT_008",
+            )
+
+        # 7. 解析 JSON
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "对话回复 JSON 解析失败 | content={} | error={}",
+                content[:500],
+                str(exc),
+            )
+            raise ExternalServiceError(
+                detail="对话回复 JSON 解析失败",
+                error_code="EXT_009",
+                extra={"content": content[:500], "error": str(exc)},
+            ) from exc
+
+        reply_text = str(data.get("reply", ""))
+        if not reply_text:
+            raise ExternalServiceError(
+                detail="LLM 返回的 reply 为空",
+                error_code="EXT_008",
+            )
+
+        logger.info(
+            "生成对话回复完成 | user_id={} | recruiter={} | reply_len={}",
+            user_id,
+            request.recruiter_name,
+            len(reply_text),
+        )
+
+        return ConversationReplyResponse(suggested_reply=reply_text)
+
+    async def sync_messages(
+        self,
+        user_id: uuid.UUID,
+        request: ConversationSyncRequest,
+    ) -> ConversationSyncResponse:
+        """同步 DOM 提取的消息到后端
+
+        按 (user_id, job_id, recruiter_name) 查找或创建 Conversation。
+        DOM 提取是全量快照，messages 全量覆盖。
+
+        Args:
+            user_id: 用户 ID
+            request: 消息同步请求
+
+        Returns:
+            ConversationSyncResponse（含 conversation_id 和 message_count）
+        """
+        from app.infra.repositories.conversation_repo import ConversationRepository
+
+        repo = ConversationRepository(self._session)
+
+        # 查找或创建
+        conversation = await repo.get_by_job_and_recruiter(
+            user_id=user_id,
+            job_id=request.job_id,
+            recruiter_name=request.recruiter_name,
+        )
+
+        messages_dicts = [msg.model_dump() for msg in request.messages]
+        last_msg_at = None
+        if request.messages:
+            last_msg = request.messages[-1]
+            if last_msg.timestamp:
+                last_msg_at = last_msg.timestamp
+
+        if conversation is None:
+            conversation = await repo.create(
+                user_id=user_id,
+                recruiter_name=request.recruiter_name,
+                job_id=request.job_id,
+                messages=messages_dicts,
+            )
+            if last_msg_at:
+                conversation.last_message_at = datetime.fromisoformat(last_msg_at)
+                await self._session.flush()
+        else:
+            await repo.update_messages(
+                conversation,
+                messages_dicts,
+                last_message_at=last_msg_at,
+            )
+
+        await self._session.commit()
+
+        logger.info(
+            "同步对话消息 | user_id={} | conversation_id={} | recruiter={} | count={}",
+            user_id,
+            conversation.id,
+            request.recruiter_name,
+            len(request.messages),
+        )
+
+        return ConversationSyncResponse(
+            conversation_id=conversation.id,
+            message_count=len(request.messages),
+        )
 
     async def close(self) -> None:
         """关闭 LLM 客户端"""

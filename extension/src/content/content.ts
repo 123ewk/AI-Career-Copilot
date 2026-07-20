@@ -21,6 +21,8 @@
  */
 
 import { bossAdapter } from '../modules/boss/adapter'
+import { chatAdapter } from '../modules/boss/chat_adapter'
+import { diagnoseSelectors } from '../modules/boss/chat_selector'
 import type { RawBossJob } from '../modules/boss/parser'
 import {
   ChromeMessageType,
@@ -229,10 +231,12 @@ console.log(
  */
 if (pageInfo.isListPage) {
   initListPage()
+} else if (pageInfo.isChatPage) {
+  initChatPage()
 } else {
   // 非列表页：仅监听 URL 变化，跳转到列表页时启动
   bossAdapter.observe({
-    onUrlChanged: (url, isListPage) => {
+    onUrlChanged: (url, isListPage, isChatPage) => {
       void sendMessageToBackground(ChromeMessageType.PAGE_CHANGED, {
         url,
         isBossListPage: isListPage,
@@ -244,6 +248,11 @@ if (pageInfo.isListPage) {
         sentJobTracker.clear()
         currentSelectedDetailUrl = ''
         initListPage()
+      }
+      // SPA 跳转到聊天页时，重新初始化
+      if (isChatPage) {
+        bossAdapter.disconnect()
+        initChatPage()
       }
     },
   })
@@ -495,7 +504,7 @@ function initListPage(): void {
     onDetailExtracted: (detail) => {
       void sendDetailExtracted(detail)
     },
-    onUrlChanged: (url, isListPage) => {
+    onUrlChanged: (url, isListPage, isChatPage) => {
       void sendMessageToBackground(ChromeMessageType.PAGE_CHANGED, {
         url,
         isBossListPage: isListPage,
@@ -509,6 +518,106 @@ function initListPage(): void {
         currentSelectedDetailUrl = ''
         initListPage()
       }
+      // 跳转到聊天页时，重新初始化
+      if (isChatPage) {
+        bossAdapter.disconnect()
+        clearApiTimeout()
+        initChatPage()
+      }
+    },
+  })
+}
+
+// ==================== 聊天页初始化 ====================
+
+/**
+ * 聊天页初始化逻辑
+ *
+ * 检测到 BOSS 聊天页时：
+ * 1. 通知 SW 当前在聊天页
+ * 2. 提取当前对话的消息 + 对话详情（公司、职位、薪资）
+ * 3. 启动 MutationObserver 监听消息变化和对话切换
+ * 4. 监听 SW 转发的注入指令
+ */
+function initChatPage(): void {
+  const recruiterName = chatAdapter.getActiveConversationName()
+  const conversationId = `conv-${Date.now()}-${recruiterName}`
+  const detail = chatAdapter.getConversationDetail()
+
+  console.log(
+    '[AI Career Copilot] Chat page detected | recruiter=',
+    recruiterName,
+    '| company=',
+    detail?.company ?? '',
+    '| job=',
+    detail?.jobTitle ?? '',
+  )
+
+  // 通知 SW 当前页面状态（与列表页同级，让 SidePanel 知道在聊天页）
+  void sendMessageToBackground(ChromeMessageType.PAGE_CHANGED, {
+    url: window.location.href,
+    isBossListPage: false,
+  })
+
+  // 通知 SW 当前在聊天页（含对话详情）
+  void sendMessageToBackground(ChromeMessageType.CHAT_PAGE_DETECTED, {
+    pageUrl: window.location.href,
+    recruiterName,
+    company: detail?.company ?? '',
+    jobTitle: detail?.jobTitle ?? '',
+    jobSalary: detail?.jobSalary ?? '',
+  })
+
+  // 初始提取消息
+  const messages = chatAdapter.extractMessages()
+  if (messages.length > 0) {
+    void sendMessageToBackground(ChromeMessageType.CHAT_MESSAGES_EXTRACTED, {
+      conversationId,
+      recruiterName,
+      company: detail?.company ?? '',
+      jobTitle: detail?.jobTitle ?? '',
+      jobSalary: detail?.jobSalary ?? '',
+      messages,
+      pageUrl: window.location.href,
+    })
+  }
+
+  // 发送选择器诊断结果（帮助调试选择器是否匹配）
+  const diagnostics = diagnoseSelectors()
+  console.log('[AI Career Copilot] Chat diagnostics:', diagnostics)
+  void sendMessageToBackground(ChromeMessageType.CHAT_DIAGNOSE, {
+    diagnostics,
+  })
+
+  // 启动监听
+  chatAdapter.observe({
+    onMessagesChanged: (msgs) => {
+      const currentRecruiter = chatAdapter.getActiveConversationName()
+      const currentDetail = chatAdapter.getConversationDetail()
+      void sendMessageToBackground(ChromeMessageType.CHAT_MESSAGES_EXTRACTED, {
+        conversationId,
+        recruiterName: currentRecruiter || recruiterName,
+        company: currentDetail?.company ?? detail?.company ?? '',
+        jobTitle: currentDetail?.jobTitle ?? detail?.jobTitle ?? '',
+        jobSalary: currentDetail?.jobSalary ?? detail?.jobSalary ?? '',
+        messages: msgs,
+        pageUrl: window.location.href,
+      })
+    },
+    onConversationSwitched: (newRecruiterName) => {
+      const newConvId = `conv-${Date.now()}-${newRecruiterName}`
+      // 切换对话后，等待 DOM 更新再提取详情
+      setTimeout(() => {
+        const newDetail = chatAdapter.getConversationDetail()
+        void sendMessageToBackground(ChromeMessageType.CHAT_CONVERSATION_CHANGED, {
+          pageUrl: window.location.href,
+          recruiterName: newRecruiterName,
+          conversationId: newConvId,
+          company: newDetail?.company ?? '',
+          jobTitle: newDetail?.jobTitle ?? '',
+          jobSalary: newDetail?.jobSalary ?? '',
+        })
+      }, 600)
     },
   })
 }
@@ -646,6 +755,23 @@ onMessage((message) => {
       currentSelectedDetailUrl = payload.sourceUrl
       const result = clickBossJobCard(payload.sourceUrl)
       return result
+    }
+    case ChromeMessageType.INJECT_CHAT_TEXT: {
+      const payload = message.payload as { text: string }
+      const ok = chatAdapter.injectText(payload.text)
+      return { ok, error: ok ? undefined : '注入文本失败：未找到输入框' }
+    }
+    case ChromeMessageType.INJECT_AND_SEND_CHAT_TEXT: {
+      const payload = message.payload as { text: string }
+      const injected = chatAdapter.injectText(payload.text)
+      if (!injected) {
+        return { ok: false, error: '注入文本失败：未找到输入框' }
+      }
+      // 延迟 500ms 确保文本已渲染，再点击发送
+      setTimeout(() => {
+        chatAdapter.clickSend()
+      }, 500)
+      return { ok: true }
     }
     default:
       return { ok: true }

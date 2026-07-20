@@ -1048,6 +1048,214 @@ async function handleResumeDelete(
   }
 }
 
+// ==================== 沟通模块 Handler ====================
+
+/**
+ * CHAT_PAGE_DETECTED handler
+ *
+ * Content Script 检测到聊天页时发送，SW 记录日志
+ */
+async function handleChatPageDetected(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_PAGE_DETECTED],
+): Promise<ChromeMessageResponse> {
+  console.log(`[SW] CHAT_PAGE_DETECTED | url=${payload.pageUrl} | recruiter=${payload.recruiterName}`)
+  return { ok: true }
+}
+
+/**
+ * CHAT_DIAGNOSE handler
+ *
+ * Content Script 发送选择器诊断结果，SW 广播给 SidePanel
+ */
+async function handleChatDiagnose(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_DIAGNOSE],
+): Promise<ChromeMessageResponse> {
+  console.log('[SW] CHAT_DIAGNOSE')
+  broadcastToSidePanel(ChromeMessageType.CHAT_DIAGNOSE, payload)
+  return { ok: true }
+}
+
+/**
+ * CHAT_MESSAGES_EXTRACTED handler
+ *
+ * Content Script 从聊天页提取消息后发送，SW 同步到后端并广播给 SidePanel
+ */
+async function handleChatMessagesExtracted(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_MESSAGES_EXTRACTED],
+): Promise<ChromeMessageResponse> {
+  const { conversationId, recruiterName, messages, pageUrl } = payload
+
+  console.log(`[SW] CHAT_MESSAGES_EXTRACTED | recruiter=${recruiterName} | count=${messages.length}`)
+
+  await initSession()
+  if (!getAccessToken()) {
+    return { ok: false, error: '未登录，请先在 Popup 登录' }
+  }
+
+  // 同步到后端
+  try {
+    await fetchBackend('/api/conversations/sync', {
+      method: 'POST',
+      body: JSON.stringify({
+        recruiter_name: recruiterName,
+        messages,
+      }),
+    })
+  } catch (err) {
+    console.warn('[SW] 对话同步到后端失败:', err)
+    // 同步失败不影响 SidePanel 更新（降级为本地模式）
+  }
+
+  // 广播到 SidePanel
+  broadcastToSidePanel(ChromeMessageType.CHAT_MESSAGES_UPDATED, {
+    conversationId,
+    recruiterName,
+    messages,
+    pageUrl,
+  })
+
+  return { ok: true }
+}
+
+/**
+ * CHAT_CONVERSATION_CHANGED handler
+ *
+ * 用户在 BOSS 左侧切换对话时，Content Script 发送此消息
+ * SW 广播到 SidePanel 以切换上下文
+ */
+async function handleChatConversationChanged(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATION_CHANGED],
+): Promise<ChromeMessageResponse> {
+  const { recruiterName, conversationId } = payload
+
+  console.log(`[SW] CHAT_CONVERSATION_CHANGED | recruiter=${recruiterName}`)
+
+  // 广播到 SidePanel
+  broadcastToSidePanel(ChromeMessageType.CHAT_CONVERSATION_SWITCHED, {
+    conversationId,
+    recruiterName,
+  })
+
+  return { ok: true }
+}
+
+/**
+ * REQUEST_CHAT_REPLY handler
+ *
+ * SidePanel 请求 AI 生成对话回复（同步，~2s）
+ * 调用 POST /api/communication/reply 直接返回 suggested_reply
+ */
+async function handleRequestChatReply(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.REQUEST_CHAT_REPLY],
+): Promise<ChromeMessageResponse> {
+  const { jobId, recruiterName, messages, resumeId, tone } = payload
+
+  console.log(`[SW] REQUEST_CHAT_REPLY | recruiter=${recruiterName} | msgCount=${messages.length}`)
+
+  await initSession()
+  if (!getAccessToken()) {
+    return { ok: false, error: '未登录，请先在 Popup 登录' }
+  }
+
+  try {
+    const data = await fetchBackend<{ suggested_reply: string; conversation_id?: string }>(
+      '/api/communication/reply',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          job_id: jobId ?? null,
+          recruiter_name: recruiterName,
+          messages,
+          resume_id: resumeId ?? null,
+          tone: tone ?? 'natural',
+        }),
+      },
+    )
+    return { ok: true, data }
+  } catch (err) {
+    const errorMsg =
+      err instanceof BackendError
+        ? `${err.statusCode}: ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err)
+    return { ok: false, error: `生成回复失败：${errorMsg}` }
+  }
+}
+
+/**
+ * INJECT_CHAT_TEXT_FROM_SIDEPANEL handler
+ *
+ * SidePanel 审核模式：请求将文本注入到 BOSS 聊天输入框
+ * SW 找到活跃的 BOSS 聊天 Tab，转发 INJECT_CHAT_TEXT 消息
+ */
+async function handleInjectChatTextFromSidepanel(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.INJECT_CHAT_TEXT_FROM_SIDEPANEL],
+): Promise<ChromeMessageResponse> {
+  const { text } = payload
+
+  console.log(`[SW] INJECT_CHAT_TEXT_FROM_SIDEPANEL | textLen=${text.length}`)
+
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id) {
+        resolve({ ok: false, error: '未找到当前激活的 Tab' })
+        return
+      }
+      // 验证是 BOSS 聊天页
+      if (!tab.url?.includes('zhipin.com/web/geek/chat')) {
+        resolve({ ok: false, error: '当前页面不是 BOSS 聊天页' })
+        return
+      }
+      sendMessageToTab(tab.id, ChromeMessageType.INJECT_CHAT_TEXT, { text })
+        .then(resolve)
+        .catch((err: unknown) => {
+          resolve({
+            ok: false,
+            error: `注入失败：${err instanceof Error ? err.message : String(err)}`,
+          })
+        })
+    })
+  })
+}
+
+/**
+ * AUTO_SEND_REPLY handler
+ *
+ * SidePanel 自动模式：请求注入文本并自动点击发送
+ * SW 找到活跃的 BOSS 聊天 Tab，转发 INJECT_AND_SEND_CHAT_TEXT 消息
+ */
+async function handleAutoSendReply(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.AUTO_SEND_REPLY],
+): Promise<ChromeMessageResponse> {
+  const { text } = payload
+
+  console.log(`[SW] AUTO_SEND_REPLY | textLen=${text.length}`)
+
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id) {
+        resolve({ ok: false, error: '未找到当前激活的 Tab' })
+        return
+      }
+      if (!tab.url?.includes('zhipin.com/web/geek/chat')) {
+        resolve({ ok: false, error: '当前页面不是 BOSS 聊天页' })
+        return
+      }
+      sendMessageToTab(tab.id, ChromeMessageType.INJECT_AND_SEND_CHAT_TEXT, { text })
+        .then(resolve)
+        .catch((err: unknown) => {
+          resolve({
+            ok: false,
+            error: `自动发送失败：${err instanceof Error ? err.message : String(err)}`,
+          })
+        })
+    })
+  })
+}
+
 // ==================== 路由初始化 ====================
 
 /**
@@ -1086,6 +1294,13 @@ export function initMessageRouter(): () => void {
   registerHandler(ChromeMessageType.RESUME_GET, handleResumeGet)
   registerHandler(ChromeMessageType.RESUME_SET_ACTIVE, handleResumeSetActive)
   registerHandler(ChromeMessageType.RESUME_DELETE, handleResumeDelete)
+  registerHandler(ChromeMessageType.CHAT_PAGE_DETECTED, handleChatPageDetected)
+  registerHandler(ChromeMessageType.CHAT_DIAGNOSE, handleChatDiagnose)
+  registerHandler(ChromeMessageType.CHAT_MESSAGES_EXTRACTED, handleChatMessagesExtracted)
+  registerHandler(ChromeMessageType.CHAT_CONVERSATION_CHANGED, handleChatConversationChanged)
+  registerHandler(ChromeMessageType.REQUEST_CHAT_REPLY, handleRequestChatReply)
+  registerHandler(ChromeMessageType.INJECT_CHAT_TEXT_FROM_SIDEPANEL, handleInjectChatTextFromSidepanel)
+  registerHandler(ChromeMessageType.AUTO_SEND_REPLY, handleAutoSendReply)
 
   // 注册 chrome.runtime.onMessage 监听
   const listener = (

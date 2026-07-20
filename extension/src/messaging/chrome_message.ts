@@ -125,6 +125,41 @@ export const ChromeMessageType = {
 
   /** SidePanel 请求删除简历 */
   RESUME_DELETE: "RESUME_DELETE",
+
+  // ==================== 沟通模块消息 ====================
+
+  /** Content Script 提取到聊天消息 → 通知 Service Worker 同步到后端 */
+  CHAT_MESSAGES_EXTRACTED: "CHAT_MESSAGES_EXTRACTED",
+
+  /** Content Script 检测到聊天页 → 通知 Service Worker */
+  CHAT_PAGE_DETECTED: "CHAT_PAGE_DETECTED",
+
+  /** Content Script 检测到用户在 BOSS 左侧切换了对话 → 通知 Service Worker */
+  CHAT_CONVERSATION_CHANGED: "CHAT_CONVERSATION_CHANGED",
+
+  /** Service Worker 请求 Content Script 注入文本到聊天输入框（审核模式） */
+  INJECT_CHAT_TEXT: "INJECT_CHAT_TEXT",
+
+  /** Service Worker 请求 Content Script 注入文本并自动点击发送（自动模式） */
+  INJECT_AND_SEND_CHAT_TEXT: "INJECT_AND_SEND_CHAT_TEXT",
+
+  /** SidePanel 请求 AI 生成对话回复 */
+  REQUEST_CHAT_REPLY: "REQUEST_CHAT_REPLY",
+
+  /** SidePanel 请求注入文本到聊天输入框（审核模式，经由 SW 转发） */
+  INJECT_CHAT_TEXT_FROM_SIDEPANEL: "INJECT_CHAT_TEXT_FROM_SIDEPANEL",
+
+  /** SidePanel 请求自动发送回复（注入 + 点击发送） */
+  AUTO_SEND_REPLY: "AUTO_SEND_REPLY",
+
+  /** Service Worker 广播消息更新到 SidePanel */
+  CHAT_MESSAGES_UPDATED: "CHAT_MESSAGES_UPDATED",
+
+  /** Service Worker 广播对话切换到 SidePanel */
+  CHAT_CONVERSATION_SWITCHED: "CHAT_CONVERSATION_SWITCHED",
+
+  /** Content Script 发送聊天页选择器诊断结果到 SidePanel */
+  CHAT_DIAGNOSE: "CHAT_DIAGNOSE",
 } as const
 
 /** 消息类型字面量联合（用于泛型约束） */
@@ -347,6 +382,113 @@ export interface ChromeMessagePayloadMap {
   [ChromeMessageType.RESUME_DELETE]: {
     /** 简历 UUID */
     resumeId: string
+  }
+
+  // ==================== 沟通模块消息载荷 ====================
+
+  [ChromeMessageType.CHAT_MESSAGES_EXTRACTED]: {
+    /** 对话 ID（本地生成的 UUID） */
+    conversationId: string
+    /** 招聘方姓名 */
+    recruiterName: string
+    /** 公司名称（从对话详情提取） */
+    company?: string
+    /** 当前职位名称 */
+    jobTitle?: string
+    /** 薪资范围 */
+    jobSalary?: string
+    /** 提取到的消息列表 */
+    messages: Array<{ role: 'user' | 'recruiter'; text: string; timestamp?: string }>
+    /** 当前页面 URL */
+    pageUrl: string
+  }
+
+  [ChromeMessageType.CHAT_PAGE_DETECTED]: {
+    /** 当前页面 URL */
+    pageUrl: string
+    /** 招聘方姓名 */
+    recruiterName: string
+    /** 公司名称 */
+    company?: string
+    /** 当前职位名称 */
+    jobTitle?: string
+    /** 薪资范围 */
+    jobSalary?: string
+  }
+
+  [ChromeMessageType.CHAT_CONVERSATION_CHANGED]: {
+    /** 当前页面 URL */
+    pageUrl: string
+    /** 新的招聘方姓名 */
+    recruiterName: string
+    /** 新的对话 ID */
+    conversationId: string
+    /** 公司名称 */
+    company?: string
+    /** 当前职位名称 */
+    jobTitle?: string
+    /** 薪资范围 */
+    jobSalary?: string
+  }
+
+  [ChromeMessageType.INJECT_CHAT_TEXT]: {
+    /** 要注入的文本 */
+    text: string
+  }
+
+  [ChromeMessageType.INJECT_AND_SEND_CHAT_TEXT]: {
+    /** 要注入并发送的文本 */
+    text: string
+  }
+
+  [ChromeMessageType.REQUEST_CHAT_REPLY]: {
+    /** 对话 ID */
+    conversationId: string
+    /** 关联岗位 ID（可选） */
+    jobId?: string
+    /** 招聘方姓名 */
+    recruiterName: string
+    /** 对话消息列表 */
+    messages: Array<{ role: 'user' | 'recruiter'; text: string; timestamp?: string }>
+    /** 简历 ID（可选） */
+    resumeId?: string
+    /** 回复风格 */
+    tone?: 'natural' | 'formal' | 'enthusiastic'
+  }
+
+  [ChromeMessageType.INJECT_CHAT_TEXT_FROM_SIDEPANEL]: {
+    /** 要注入的文本 */
+    text: string
+  }
+
+  [ChromeMessageType.AUTO_SEND_REPLY]: {
+    /** 对话 ID */
+    conversationId: string
+    /** 要发送的文本 */
+    text: string
+  }
+
+  [ChromeMessageType.CHAT_MESSAGES_UPDATED]: {
+    /** 对话 ID */
+    conversationId: string
+    /** 招聘方姓名 */
+    recruiterName: string
+    /** 消息列表 */
+    messages: Array<{ role: 'user' | 'recruiter'; text: string; timestamp?: string }>
+    /** 页面 URL */
+    pageUrl: string
+  }
+
+  [ChromeMessageType.CHAT_CONVERSATION_SWITCHED]: {
+    /** 对话 ID */
+    conversationId: string
+    /** 招聘方姓名 */
+    recruiterName: string
+  }
+
+  [ChromeMessageType.CHAT_DIAGNOSE]: {
+    /** 诊断结果（ChatDiagnosticResult 结构） */
+    diagnostics: unknown
   }
 }
 
