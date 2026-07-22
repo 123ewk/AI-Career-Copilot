@@ -160,6 +160,38 @@ export const ChromeMessageType = {
 
   /** Content Script 发送聊天页选择器诊断结果到 SidePanel */
   CHAT_DIAGNOSE: "CHAT_DIAGNOSE",
+
+  /** Content Script 提取左侧对话列表 → SW 缓存 + 广播到 SidePanel */
+  CHAT_CONVERSATIONS_EXTRACTED: "CHAT_CONVERSATIONS_EXTRACTED",
+
+  /** SidePanel 请求 SW 返回缓存的对话列表（打开时主动拉取） */
+  REQUEST_CONVERSATIONS_LIST: "REQUEST_CONVERSATIONS_LIST",
+
+  /**
+   * Content Script 收到主世界拦截器转发的 HR 基础列表数据
+   *
+   * 数据来源：GET /wapi/zprelation/friend/geekFilterByLabel
+   * - 主世界拦截器捕获 API 响应后通过 postMessage 发送 BOSS_CHAT_LIST_CAPTURED
+   * - Content Script 接收后转发给 SW，SW 解析为 ApiChatFriend[] 并缓存/广播
+   *
+   * 与 CHAT_CONVERSATIONS_EXTRACTED 的区别：
+   * - CHAT_CONVERSATIONS_EXTRACTED 来自 DOM 提取（chat_adapter.extractConversations）
+   * - CHAT_LIST_CAPTURED 来自 API 拦截（friendList 完整列表，不受虚拟滚动限制）
+   */
+  CHAT_LIST_CAPTURED: "CHAT_LIST_CAPTURED",
+
+  /**
+   * Content Script 收到主世界拦截器转发的 HR 详情数据
+   *
+   * 数据来源：POST /wapi/zprelation/friend/getGeekFriendList.json
+   * - 包含 securityId（拉取消息历史用，本次不使用）
+   * - 包含 lastMessageInfo（最后消息内容 + 时间戳）
+   * - 包含 unreadMsgCount（未读消息数）
+   * - 包含 encryptBossId / encryptUid（加密ID）
+   *
+   * SW 收到后合并到对应的 ChatConversationItem，补全消息预览和未读数
+   */
+  CHAT_DETAIL_CAPTURED: "CHAT_DETAIL_CAPTURED",
 } as const
 
 /** 消息类型字面量联合（用于泛型约束） */
@@ -341,6 +373,20 @@ export interface ChromeMessagePayloadMap {
   [ChromeMessageType.RESET_EXTRACTION_STATE]: {
     /** 是否同时清空持久化的 sidepanel_state（登出时用） */
     clearSidePanelStorage?: boolean
+    /**
+     * 是否保留 Chat 模块缓存（SidePanel 重开场景用）
+     *
+     * 设计动机：
+     * - SidePanel 每次打开都会发 RESET_EXTRACTION_STATE 清空状态
+     * - 但 Chat 模块的 cachedConversations / cachedChatFriends / cachedChatDetails
+     *   是 Content Script 在页面加载时已经发送给 SW 的数据
+     * - 如果 SidePanel 打开时清空这些缓存,会导致用户重开 SidePanel 后看不到对话列表
+     *   (Content Script 不会再次主动广播 CHAT_CONVERSATIONS_EXTRACTED)
+     *
+     * - true: SidePanel 重开场景,保留 Chat 缓存,只清 Job 提取状态
+     * - false/undefined: 登出场景,彻底清空所有缓存(默认行为,向后兼容)
+     */
+    keepChatCache?: boolean
   }
 
   /**
@@ -489,6 +535,99 @@ export interface ChromeMessagePayloadMap {
   [ChromeMessageType.CHAT_DIAGNOSE]: {
     /** 诊断结果（ChatDiagnosticResult 结构） */
     diagnostics: unknown
+  }
+
+  [ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED]: {
+    /**
+     * 左侧对话列表
+     *
+     * 字段来源差异：
+     * - DOM 提取：仅 id/recruiterName/company/lastMessage/isActive（5 个字段）
+     * - API 合并：完整字段（含 jobTitle/jobId/recruiterJobTitle/lastMessageAt/unreadCount 等）
+     *
+     * SW 在广播时根据数据来源决定字段集合：
+     * - pageUrl='api-merged' 时为完整字段
+     * - 其他 pageUrl 时为 DOM 提取的 5 个字段
+     *
+     * SidePanel 收到后通过可选字段访问,缺省字段用默认值
+     */
+    conversations: Array<{
+      id: string
+      recruiterName: string
+      company: string
+      lastMessage: string
+      isActive: boolean
+      /** API 合并字段：招聘方职位（如 "招聘hr"） */
+      recruiterJobTitle?: string
+      /** API 合并字段：职位名称（如 "python实习"） */
+      jobTitle?: string
+      /** API 合并字段：关联岗位加密ID */
+      jobId?: string | null
+      /** API 合并字段：最后消息时间（ISO 字符串） */
+      lastMessageAt?: string | null
+      /** API 合并字段：未读消息数 */
+      unreadCount?: number
+      /** API 合并字段：消息数量 */
+      messageCount?: number
+    }>
+    /**
+     * 当前页面 URL
+     *
+     * 特殊值 'api-merged'：标识本次广播来自 Chat API 合并,非 DOM 提取
+     * SidePanel 可据此判断是否需要触发后端同步
+     */
+    pageUrl: string
+  }
+
+  [ChromeMessageType.REQUEST_CONVERSATIONS_LIST]: Record<string, never>
+
+  /**
+   * CHAT_LIST_CAPTURED 载荷
+   *
+   * Content Script 收到主世界拦截器的 postMessage 后，原样转发给 SW。
+   * SW 在 chat_api_parser 中解析 zpData.friendList，提取 HR 基础信息。
+   *
+   * payload.data 是拦截器 safeJsonParse 后的对象，类型为 unknown
+   * （解析责任在 SW 侧，避免主世界与扩展类型耦合）
+   */
+  [ChromeMessageType.CHAT_LIST_CAPTURED]: {
+    /** 拦截到的 API URL */
+    url: string
+    /** HTTP 方法 */
+    method: string
+    /** HTTP 状态码 */
+    status: number
+    /** safeJsonParse 后的响应体（SW 侧再校验） */
+    data: unknown
+    /** 响应头（Fetch 为对象，XHR 为字符串） */
+    headers: Record<string, string> | string
+    /** 当前页面 URL（用于 SW 日志） */
+    pageUrl: string
+  }
+
+  /**
+   * CHAT_DETAIL_CAPTURED 载荷
+   *
+   * Content Script 收到主世界拦截器的 postMessage 后，原样转发给 SW。
+   * SW 在 chat_api_parser 中解析 zpData.result，提取每个 HR 的详情：
+   * - securityId（拉取消息历史用，本次不使用）
+   * - lastMessageInfo（最后消息内容 + 时间戳）
+   * - unreadMsgCount（未读消息数）
+   * - encryptBossId / encryptUid（加密ID）
+   */
+  [ChromeMessageType.CHAT_DETAIL_CAPTURED]: {
+    /** 拦截到的 API URL */
+    url: string
+    /** HTTP 方法 */
+    method: string
+    /** HTTP 状态码 */
+    status: number
+    /** safeJsonParse 后的响应体（SW 侧再校验） */
+    data: unknown
+    /** 响应头 */
+    headers: Record<string, string> | string
+    /** 当前页面 URL */
+    pageUrl: string
   }
 }
 

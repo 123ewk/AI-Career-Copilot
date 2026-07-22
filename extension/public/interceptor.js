@@ -24,14 +24,51 @@
   console.log('[Boss拦截器] XMLHttpRequest 类型:', typeof XMLHttpRequest)
 
   // 常量声明必须在使用前完成，避免 TDZ（Temporal Dead Zone）导致 sendLog 静默失败
-  const TARGET_API_PATTERNS = [
+  // 职位列表 API（已存在）
+  const JOB_API_PATTERNS = [
     '/wapi/zpgeek/pc/recommend/job/list.json',
     '/wapi/zpgeek/search/job/list.json',
     '/wapi/zpgeek/job/list.json',
   ]
 
-  const MESSAGE_TYPE = 'BOSS_JOB_DATA_CAPTURED'
+  // 聊天 API（2026-07-21 逆向分析确认）
+  // - geekFilterByLabel: GET 获取 HR 基础列表（friendList）
+  // - getGeekFriendList.json: POST 获取 HR 详情（含 securityId/lastMessageInfo/unreadMsgCount）
+  // 注：history/pull 返回 Protobuf+Base64，本次不拦截，消息历史走 DOM 兜底
+  const CHAT_LIST_API_PATTERN = '/wapi/zprelation/friend/geekFilterByLabel'
+  const CHAT_DETAIL_API_PATTERN = '/wapi/zprelation/friend/getGeekFriendList.json'
+
+  /** 消息类型：职位数据（已存在） */
+  const MESSAGE_TYPE_JOB = 'BOSS_JOB_DATA_CAPTURED'
+  /** 消息类型：HR 列表基础信息（friendList） */
+  const MESSAGE_TYPE_CHAT_LIST = 'BOSS_CHAT_LIST_CAPTURED'
+  /** 消息类型：HR 详情（含 securityId/最后消息/未读数） */
+  const MESSAGE_TYPE_CHAT_DETAIL = 'BOSS_CHAT_DETAIL_CAPTURED'
   const LOG_MESSAGE_TYPE = 'BOSS_INTERCEPTOR_LOG'
+
+  /**
+   * 根据 URL 判定数据类型
+   *
+   * 设计动机：单一入口分发，避免 fetch/XHR 拦截器中重复判定逻辑
+   * 返回值用于决定 postMessage 的 type 字段，让 Content Script 走不同处理分支
+   */
+  function classifyUrl(url) {
+    if (!url || typeof url !== 'string') return null
+    if (JOB_API_PATTERNS.some((p) => url.includes(p))) return 'job'
+    if (url.includes(CHAT_LIST_API_PATTERN)) return 'chat_list'
+    if (url.includes(CHAT_DETAIL_API_PATTERN)) return 'chat_detail'
+    return null
+  }
+
+  /**
+   * 判断 URL 是否匹配目标 API（兼容旧调用方）
+   *
+   * 保留 isTargetApi 是为了不破坏既有调试日志的语义，
+   * 内部直接复用 classifyUrl 并归一化为布尔
+   */
+  function isTargetApi(url) {
+    return classifyUrl(url) !== null
+  }
 
   // 调试开关：开启后会记录所有 fetch/XHR 请求 URL，用于定位拦截失败根因
   const DEBUG_ALL_REQUESTS = true
@@ -60,24 +97,35 @@
     return
   }
   window.__bossJobInterceptorInstalled = true
-  sendLog('info', 'Job API interceptor installed, waiting for target API calls')
-
-  /**
-   * 判断 URL 是否匹配目标 API
-   */
-  function isTargetApi(url) {
-    if (!url || typeof url !== 'string') return false
-    return TARGET_API_PATTERNS.some((pattern) => url.includes(pattern))
-  }
+  sendLog('info', 'Job & Chat API interceptor installed, waiting for target API calls')
 
   /**
    * 将捕获的数据发送给 Content Script
+   *
+   * 根据 URL 分类选择对应的消息类型：
+   * - job → BOSS_JOB_DATA_CAPTURED（职位列表）
+   * - chat_list → BOSS_CHAT_LIST_CAPTURED（HR 基础列表）
+   * - chat_detail → BOSS_CHAT_DETAIL_CAPTURED（HR 详情+最后消息）
+   *
+   * 设计动机：Content Script 通过 type 字段分流，避免在同一个 handler 里
+   * 用 URL 字符串匹配判定，降低耦合且便于扩展新的 API 拦截
    */
-  function sendCapturedData(payload) {
+  function sendCapturedData(url, payload) {
+    const kind = classifyUrl(url)
+    if (!kind) return
+
+    // 类型映射：kind → postMessage.type
+    const typeMap = {
+      job: MESSAGE_TYPE_JOB,
+      chat_list: MESSAGE_TYPE_CHAT_LIST,
+      chat_detail: MESSAGE_TYPE_CHAT_DETAIL,
+    }
+    const messageType = typeMap[kind]
+
     try {
       window.postMessage(
         {
-          type: MESSAGE_TYPE,
+          type: messageType,
           payload,
           timestamp: Date.now(),
         },
@@ -127,7 +175,7 @@
         const clonedResponse = response.clone()
         const text = await clonedResponse.text()
 
-        sendCapturedData({
+        sendCapturedData(url, {
           url,
           method: (init && init.method) || 'GET',
           status: response.status,
@@ -171,7 +219,7 @@
       console.log('[Boss拦截器] ✅ 捕获到目标 API (XHR):', url.slice(0, 120))
       xhr.addEventListener('load', function () {
         try {
-          sendCapturedData({
+          sendCapturedData(url, {
             url,
             method: xhr.__interceptorMethod || 'GET',
             status: xhr.status,
@@ -187,6 +235,6 @@
     return originalXHRSend.apply(this, [body])
   }
 
-  sendLog('info', 'Job API interceptor installed')
-  console.log('[Boss拦截器] ✅ 拦截器安装完成，等待 Boss API 请求...')
+  sendLog('info', 'Job & Chat API interceptor installed')
+  console.log('[Boss拦截器] ✅ 拦截器安装完成（Job + Chat），等待 Boss API 请求...')
 })()

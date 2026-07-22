@@ -159,6 +159,124 @@ export const useCommunicationStore = defineStore('communication', () => {
   }
 
   /**
+   * 批量更新对话列表
+   *
+   * 触发场景：
+   * - CHAT_CONVERSATIONS_EXTRACTED 广播（DOM 提取或 API 合并）
+   * - REQUEST_CONVERSATIONS_LIST 响应（SidePanel 打开时主动拉取）
+   *
+   * 数据来源差异：
+   * - DOM 提取：仅基础字段（id/recruiterName/company/lastMessage/isActive）
+   * - API 合并（pageUrl='api-merged'）：完整字段（含 jobTitle/jobId/unreadCount 等）
+   *
+   * 合并策略：
+   * - 按 id 匹配已有对话
+   * - API 数据来源（含可选字段）时，字段优先级高于已有数据（API 是权威源）
+   * - DOM 数据来源（仅基础字段）时，只更新 lastMessage/company/isActive
+   * - 不覆盖已有 messages 和 messageCount（由 CHAT_MESSAGES_EXTRACTED 单独维护）
+   * - 新增对话时保留所有字段，缺省值用默认
+   *
+   * 修复 bug：
+   * - 原实现强制设置 lastMessageAt = now，会覆盖 API 提供的真实最后消息时间
+   * - 现在优先使用 API 提供的 lastMessageAt，仅在缺失时才用 now
+   */
+  function updateConversationsList(data: {
+    conversations: Array<{
+      id: string
+      recruiterName: string
+      company: string
+      lastMessage: string
+      isActive: boolean
+      // API 合并提供的可选字段（DOM 提取时不提供）
+      recruiterJobTitle?: string
+      jobTitle?: string
+      jobId?: string | null
+      lastMessageAt?: string | null
+      unreadCount?: number
+      messageCount?: number
+    }>
+    pageUrl: string
+  }) {
+    const isApiMerged = data.pageUrl === 'api-merged'
+
+    for (const item of data.conversations) {
+      const existing = conversations.value.find((c) => c.id === item.id)
+
+      if (existing) {
+        // 已存在对话：更新基础字段
+        existing.lastMessage = item.lastMessage
+        existing.company = item.company
+
+        // lastMessageAt 优先用 API 提供的真实时间，避免覆盖为 now
+        if (item.lastMessageAt) {
+          existing.lastMessageAt = item.lastMessageAt
+        } else if (!existing.lastMessageAt) {
+          // API 未提供且已有数据也无：兜底用 now
+          existing.lastMessageAt = new Date().toISOString()
+        }
+
+        // isActive 来自 DOM 提取（无论 API 还是 DOM 数据源，都可能有 isActive）
+        existing.isActive = item.isActive
+
+        // API 合并字段：仅在 API 数据源时更新（避免 DOM 数据覆盖已有 API 字段）
+        if (isApiMerged) {
+          if (item.recruiterJobTitle !== undefined) {
+            existing.recruiterJobTitle = item.recruiterJobTitle
+          }
+          if (item.jobTitle !== undefined) {
+            existing.jobTitle = item.jobTitle
+          }
+          if (item.jobId !== undefined) {
+            existing.jobId = item.jobId
+          }
+          if (item.unreadCount !== undefined) {
+            existing.unreadCount = item.unreadCount
+          }
+          // messageCount 不在此处更新，由 CHAT_MESSAGES_EXTRACTED 维护
+        }
+      } else {
+        // 新对话：构造完整 ChatConversationItem
+        const newConversation: ChatConversationItem = {
+          id: item.id,
+          recruiterName: item.recruiterName,
+          company: item.company,
+          recruiterJobTitle: item.recruiterJobTitle,
+          jobTitle: item.jobTitle,
+          jobId: item.jobId ?? null,
+          lastMessage: item.lastMessage,
+          // 优先使用 API 提供的真实时间，无则用 now
+          lastMessageAt: item.lastMessageAt ?? new Date().toISOString(),
+          // messageCount 由 CHAT_MESSAGES_EXTRACTED 单独维护，新对话默认 0
+          messageCount: item.messageCount ?? 0,
+          unreadCount: item.unreadCount ?? 0,
+          messages: [],
+          channel: 'boss',
+          isActive: item.isActive,
+        }
+        conversations.value.push(newConversation)
+      }
+    }
+
+    // 清理：移除已不在新列表中的对话（仅 API 合并时清理，避免 DOM 部分提取误删）
+    if (isApiMerged) {
+      const newItemIds = new Set(data.conversations.map((c) => c.id))
+      conversations.value = conversations.value.filter((c) => newItemIds.has(c.id))
+    }
+
+    // 自动选中活跃对话
+    if (!activeConversationId.value) {
+      const active = data.conversations.find((c) => c.isActive)
+      if (active) {
+        activeConversationId.value = active.id
+      } else if (conversations.value.length > 0) {
+        activeConversationId.value = conversations.value[0].id
+      }
+    }
+
+    saveToStorage()
+  }
+
+  /**
    * 切换对话（Content Script 检测到用户在 BOSS 左侧切换）
    *
    * CHAT_CONVERSATION_SWITCHED 消息触发
@@ -374,6 +492,7 @@ export const useCommunicationStore = defineStore('communication', () => {
     // Actions
     setOnChatPage,
     updateFromExtracted,
+    updateConversationsList,
     switchConversation,
     setActiveConversation,
     requestReply,

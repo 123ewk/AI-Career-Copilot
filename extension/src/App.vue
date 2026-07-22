@@ -316,6 +316,13 @@ function registerMessageListeners() {
         commStore.setDiagnostics(payload.diagnostics)
         break
       }
+      case ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED: {
+        const payload =
+          message.payload as ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED]
+        console.log(`[App] CHAT_CONVERSATIONS_EXTRACTED | count=${payload.conversations.length}`)
+        commStore.updateConversationsList(payload)
+        break
+      }
       default:
         // 其他消息类型（REQUEST_* 等）由 SidePanel 主动发送，不在此处理
         break
@@ -339,7 +346,14 @@ onMounted(async () => {
 
   // 关键修复：每次打开 SidePanel，先强制重置 Content Script + SW 的提取状态
   // 避免关闭重开后复用 apiDataCaptured / sentJobTracker / source_url_map 等旧状态
-  await sendMessageToBackground(ChromeMessageType.RESET_EXTRACTION_STATE, {})
+  //
+  // keepChatCache=true：保留 Chat 模块缓存
+  // - Content Script 在 BOSS 聊天页加载时已经把对话列表发给 SW
+  // - SidePanel 重开时不应清空这些缓存,否则会丢失数据且无法重新触发 Content Script 广播
+  // - 登出场景会显式传 keepChatCache=false(或 undefined)彻底清空
+  await sendMessageToBackground(ChromeMessageType.RESET_EXTRACTION_STATE, {
+    keepChatCache: true,
+  })
 
   // 优先从 chrome.storage.local 恢复上次状态（岗位列表、分析结果、投递记录等）
   await loadFromStorage()
@@ -362,6 +376,112 @@ onMounted(async () => {
 
   // 注册消息监听
   registerMessageListeners()
+
+  // 如果在聊天页，主动向 Content Script 请求对话列表
+  //
+  // 三级 fallback 策略(2026-07-21 修复):
+  // 1. 直接向 Content Script 请求(最新鲜的 DOM 数据)
+  // 2. 失败/返回空 → 向 SW 请求缓存(可能包含 Content Script 之前发来的数据)
+  // 3. 仍失败 → 等待 Content Script 通过 MutationObserver 触发的广播
+  //
+  // 原问题:catch 块完全吞掉错误,且注释错误地说"等待广播"
+  // 实际 Content Script 的 doInitChatPage 只在页面加载时执行一次,
+  // 不会再次主动广播,所以必须依赖 SW 缓存作为 fallback
+  if (currentTab?.id && currentTab.url?.includes('zhipin.com/web/geek/chat')) {
+    const tabId = currentTab.id
+    const tabUrl = currentTab.url
+
+    /**
+     * 尝试从 Level 1(Content Script) + Level 2(SW 缓存)拉取对话列表
+     *
+     * @returns 是否成功拉取到非空对话列表
+     */
+    const tryLoadChatList = async (): Promise<boolean> => {
+      // Level 1: 直接向 Content Script 请求(最新鲜的 DOM 数据)
+      try {
+        const resp = await chrome.tabs.sendMessage(tabId, {
+          type: ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED,
+          payload: {},
+        } as never)
+        if (resp?.ok && resp.data) {
+          const data = resp.data as {
+            conversations: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED]['conversations']
+          }
+          if (data.conversations?.length > 0) {
+            commStore.updateConversationsList({
+              conversations: data.conversations,
+              pageUrl: tabUrl,
+            })
+            console.log(
+              `[App] Level 1 拉取对话列表成功 | count=${data.conversations.length}`,
+            )
+            return true
+          }
+        }
+      } catch (err) {
+        // 不再静默吞错:Content Script 未注入/未就绪/异步超时都会到这里
+        console.error('[App] Level 1 主动拉取对话列表失败:', err)
+      }
+
+      // Level 2: Level 1 失败/返回空 → 向 SW 请求缓存
+      // SW 缓存可能包含 Content Script 之前广播过来的对话列表
+      try {
+        const swResp = await sendMessageToBackground(
+          ChromeMessageType.REQUEST_CONVERSATIONS_LIST,
+          {},
+        )
+        if (swResp?.ok && swResp.data) {
+          const data = swResp.data as {
+            conversations: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED]['conversations']
+          }
+          if (data.conversations?.length > 0) {
+            commStore.updateConversationsList({
+              conversations: data.conversations,
+              pageUrl: 'sw-cache', // 标识数据来源为 SW 缓存(非 DOM 提取)
+            })
+            console.log(
+              `[App] Level 2 从 SW 缓存拉取对话列表成功 | count=${data.conversations.length}`,
+            )
+            return true
+          }
+        }
+      } catch (err) {
+        console.error('[App] Level 2 SW 缓存拉取失败:', err)
+      }
+
+      return false
+    }
+
+    // 初次尝试(Level 1 + Level 2 顺序执行)
+    let chatListLoaded = await tryLoadChatList()
+
+    // Level 3: 主动重试(每 1s 一次,共 5 次)
+    //
+    // 设计动机(2026-07-22 修复):
+    // - 之前 Level 3 只打 warn 不动作,等待 Content Script MutationObserver 广播
+    // - 但 MutationObserver 只监听"未来"变化,不触发初始快照
+    // - 场景 A:打开 BOSS 聊天页 → 等几秒 → 打开 SidePanel 时,
+    //   列表早已渲染完成,observer 永不触发,SidePanel 永远收不到广播
+    // - 修复策略:SidePanel 主动重试 Level 1/2
+    //   - 等 1s 后 Content Script 可能已重新提取(doInitChatPage 5 次重试中)
+    //   - 或 SW 缓存可能已通过其他途径获得数据
+    //   - 总等待时间 5s,覆盖 Vue SPA 异步渲染 + Content Script 重试周期
+    if (!chatListLoaded) {
+      console.warn(
+        '[App] Level 1+2 均失败,启动 Level 3 主动重试(每 1s 一次,共 5 次)',
+      )
+      for (let i = 1; i <= 5 && !chatListLoaded; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        console.log(`[App] Level 3 重试 ${i}/5`)
+        chatListLoaded = await tryLoadChatList()
+      }
+      if (!chatListLoaded) {
+        console.warn(
+          '[App] Level 3 重试 5 次仍失败,放弃,等待 Content Script MutationObserver 广播(若列表后续变化仍会被回调)',
+        )
+      }
+    }
+  }
 
   // 根据登录态 + 页面状态决定 UI 状态
   if (!store.isLoggedIn) {

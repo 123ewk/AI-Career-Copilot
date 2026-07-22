@@ -44,7 +44,9 @@ export function parseConversations(
     if (!recruiterName) return
 
     const lastMessage = queryChatText(item, CHAT_SELECTORS.conversationList.lastMessage)
-    const isActive = item.matches(CHAT_SELECTORS.conversationList.activeClass.replace('.', ''))
+    // activeClass 已是合法 CSS 选择器（'.selected'），直接传给 matches()
+    // 之前用 .replace('.', '') 把 '.selected' 变成 'selected'（标签选择器），永远匹配不到
+    const isActive = item.matches(CHAT_SELECTORS.conversationList.activeClass)
 
     // 提取公司名称（从 .title-box 内 i.vline 后的文本节点）
     const titleBox = queryChatElement(item, CHAT_SELECTORS.conversationList.companyName)
@@ -128,9 +130,9 @@ export function parseMessages(
     if (!text) return
 
     // 判断消息方向：通过 class 区分用户/招聘方
-    const isUser = item.matches(
-      CHAT_SELECTORS.messageHistory.sentByUser.replace('.', ''),
-    )
+    // sentByUser 已是合法 CSS 选择器（'.item-myself'），直接传给 matches()
+    // 之前用 .replace('.', '') 把 '.item-myself' 变成 'item-myself'（标签选择器），永远匹配不到
+    const isUser = item.matches(CHAT_SELECTORS.messageHistory.sentByUser)
     const role: 'user' | 'recruiter' = isUser ? 'user' : 'recruiter'
 
     const timestamp = queryChatText(item, CHAT_SELECTORS.messageHistory.messageTime)

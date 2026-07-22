@@ -23,6 +23,7 @@
 import type {
   ChatAdapterCallbacks,
   ChatMessage,
+  BossChatConversation,
   BossConversationDetail,
 } from '../../types/communication'
 import {
@@ -55,7 +56,7 @@ const DEBOUNCE_MS = 500
 export class ChatAdapter {
   /** 消息列表 MutationObserver */
   private messageObserver: MutationObserver | null = null
-  /** 对话列表 MutationObserver（检测用户切换对话） */
+  /** 对话列表 MutationObserver（检测用户切换对话 + 列表项变化） */
   private conversationObserver: MutationObserver | null = null
   /** 消息变化防抖定时器 */
   private messageDebounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -63,6 +64,16 @@ export class ChatAdapter {
   private conversationDebounceTimer: ReturnType<typeof setTimeout> | null = null
   /** 上次检测到的活跃对话招聘方姓名（用于检测切换） */
   private lastActiveRecruiter: string = ''
+
+  /**
+   * 上次检测到的对话列表签名(用于检测列表项变化)
+   *
+   * 设计动机:
+   * - 单纯靠 MutationObserver 触发会高频回调(任何子节点变化都触发)
+   * - 用签名(id 列表 join)对比,只在列表项数量/顺序变化时才回调
+   * - 避免 active class 切换时也误触发 onConversationsListChanged
+   */
+  private lastConversationListSignature: string = ''
 
   /**
    * 检测当前页面是否为聊天页
@@ -177,14 +188,40 @@ export class ChatAdapter {
     // 记录当前活跃对话
     this.lastActiveRecruiter = this.getActiveConversationName()
 
+    // 提取初始对话列表,用于签名对比 + 立即回调
+    //
+    // 关键修复(2026-07-22):
+    // - 原实现只把 initialConversations 用来记录签名,从未回调给上层
+    // - 导致 SidePanel 重开时 Content Script 走 resetExtractionState → initChatPage → doInitChatPage
+    //   → chatAdapter.observe() 时,即使列表已存在 5 个 HR,也不会触发 onConversationsListChanged
+    // - 因为 MutationObserver 只监听"未来"变化,签名不变就永远不回调
+    // - 现在改为:initialConversations 非空时立即回调一次,让上层(Content Script)能拿到"已存在"的数据
+    const initialConversations = this.extractConversations()
+    this.lastConversationListSignature = initialConversations
+      .map((c) => c.id)
+      .join('|')
+
+    // 立即回调初始数据(如果有):
+    // - 列表已渲染完成时,observe() 时就能拿到 5 个 HR,立即回调补发
+    // - 列表未渲染完时,initialConversations 为空,跳过,依赖后续 MutationObserver 触发
+    if (initialConversations.length > 0 && callbacks.onConversationsListChanged) {
+      console.log(
+        `[ChatAdapter] observe() 检测到初始对话列表 | count=${initialConversations.length} | 立即回调`,
+      )
+      callbacks.onConversationsListChanged(initialConversations)
+    }
+
     // 1. 消息变化监听
     if (callbacks.onMessagesChanged) {
       this.setupMessageObserver(callbacks.onMessagesChanged)
     }
 
-    // 2. 对话切换监听
-    if (callbacks.onConversationSwitched) {
-      this.setupConversationObserver(callbacks.onConversationSwitched)
+    // 2. 对话切换 + 列表变化监听(合并到同一个 observer,避免重复监听同一容器)
+    if (callbacks.onConversationSwitched || callbacks.onConversationsListChanged) {
+      this.setupConversationObserver(
+        callbacks.onConversationSwitched ?? (() => {}),
+        callbacks.onConversationsListChanged ?? null,
+      )
     }
 
     return () => this.disconnect()
@@ -256,18 +293,30 @@ export class ChatAdapter {
   /**
    * 设置对话列表 MutationObserver
    *
-   * 监听对话列表的 DOM 变化，检测 active class 切换
-   * 用户在 BOSS 左侧点击不同对话时，active class 会从一个 item 移到另一个
+   * 监听对话列表的 DOM 变化,合并两种检测:
+   * 1. active class 切换 → onConversationSwitched
+   *    用户在 BOSS 左侧点击不同对话时,active class 会从一个 item 移到另一个
+   * 2. 列表项数量/顺序变化 → onConversationsListChanged
+   *    Content Script 启动时 DOM 未渲染完,后续异步渲染完成时补发对话列表
+   *
+   * 设计动机(2026-07-21 修复):
+   * - 原 observer 只检测 active 切换,无法感知列表项增多
+   * - 现增加签名(id 列表 join)对比,只在数量/顺序变化时才回调
+   * - 合并到同一个 observer,避免重复监听同一容器造成性能浪费
+   *
+   * @param onConversationSwitched active 切换回调
+   * @param onConversationsListChanged 列表项变化回调(可选)
    */
   private setupConversationObserver(
     onConversationSwitched: (newRecruiterName: string) => void,
+    onConversationsListChanged: ((conversations: BossChatConversation[]) => void) | null,
   ): void {
     const container = document.querySelector(CHAT_SELECTORS.conversationList.container)
     if (!container) {
       setTimeout(() => {
         const retryContainer = document.querySelector(CHAT_SELECTORS.conversationList.container)
         if (retryContainer) {
-          this.setupConversationObserver(onConversationSwitched)
+          this.setupConversationObserver(onConversationSwitched, onConversationsListChanged)
         }
       }, 1000)
       return
@@ -278,16 +327,35 @@ export class ChatAdapter {
         clearTimeout(this.conversationDebounceTimer)
       }
       this.conversationDebounceTimer = setTimeout(() => {
+        // 1. 检测 active class 切换
         const currentActive = this.getActiveConversationName()
         if (currentActive && currentActive !== this.lastActiveRecruiter) {
           this.lastActiveRecruiter = currentActive
           onConversationSwitched(currentActive)
         }
+
+        // 2. 检测列表项数量/顺序变化(签名对比)
+        if (onConversationsListChanged) {
+          const conversations = this.extractConversations()
+          const currentSignature = conversations.map((c) => c.id).join('|')
+
+          if (currentSignature !== this.lastConversationListSignature) {
+            this.lastConversationListSignature = currentSignature
+            // 仅在有对话时回调(避免空列表误触发)
+            if (conversations.length > 0) {
+              console.log(
+                `[ChatAdapter] 对话列表变化 | count=${conversations.length} | signature=${currentSignature.slice(0, 80)}`,
+              )
+              onConversationsListChanged(conversations)
+            }
+          }
+        }
+
         this.conversationDebounceTimer = null
       }, DEBOUNCE_MS)
     })
 
-    // 监听属性变化（active class 切换是 class 属性变化）
+    // 监听属性变化（active class 切换是 class 属性变化）+ 子节点变化(列表项增减)
     this.conversationObserver.observe(container, {
       childList: true,
       subtree: true,

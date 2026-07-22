@@ -7,6 +7,11 @@
  * - 高亮当前活跃对话
  * - 点击切换对话
  * - 空状态显示选择器诊断信息
+ *
+ * 空状态分支(2026-07-21 修复):
+ * - 未打开聊天页:引导用户前往 BOSS 直聘聊天页
+ * - 已打开聊天页但无选中对话:引导用户点击对话
+ * - 已打开聊天页且 SW 缓存为空:提示正在等待数据
  */
 
 import { computed } from 'vue'
@@ -14,7 +19,7 @@ import { storeToRefs } from 'pinia'
 import { useCommunicationStore } from '../../stores/communication'
 
 const commStore = useCommunicationStore()
-const { sortedConversations, activeConversationId, diagnostics } = storeToRefs(commStore)
+const { sortedConversations, activeConversationId, diagnostics, isOnChatPage } = storeToRefs(commStore)
 
 /** 格式化诊断结果为可读列表 */
 const diagnosticItems = computed(() => {
@@ -47,6 +52,27 @@ const chatClasses = computed(() => {
   const d = diagnostics.value as Record<string, unknown>
   return (d.allChatClasses as string[]) ?? []
 })
+
+/**
+ * 空状态文案(根据是否在聊天页 + 是否有活跃对话)
+ *
+ * 三种场景:
+ * 1. 未在聊天页 → "请打开 BOSS 直聘聊天页"
+ * 2. 在聊天页但无对话数据 → "正在加载对话列表...或点击 BOSS 页面任意对话"
+ * 3. 在聊天页有对话数据但无选中 → 由列表项展示,不会进入此分支
+ */
+const emptyState = computed(() => {
+  if (!isOnChatPage.value) {
+    return {
+      title: '未检测到聊天页',
+      hint: '请在浏览器中打开 BOSS 直聘聊天页(https://www.zhipin.com/web/geek/chat)',
+    }
+  }
+  return {
+    title: '正在加载对话列表',
+    hint: '请确保已在 BOSS 直聘聊天页点击一个对话(若已点击仍为空,请关闭重开 SidePanel)',
+  }
+})
 </script>
 
 <template>
@@ -72,8 +98,8 @@ const chatClasses = computed(() => {
         <span v-if="conv.messageCount > 0" class="conv-count">{{ conv.messageCount }}</span>
       </div>
       <div v-if="sortedConversations.length === 0" class="conv-empty">
-        <div class="empty-title">暂无对话</div>
-        <div class="empty-hint">请确保已打开 BOSS 直聘聊天页并选中一个对话</div>
+        <div class="empty-title">{{ emptyState.title }}</div>
+        <div class="empty-hint">{{ emptyState.hint }}</div>
 
         <!-- 选择器诊断信息 -->
         <div v-if="diagnosticItems.length > 0" class="diagnostics">

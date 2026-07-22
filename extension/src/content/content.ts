@@ -40,15 +40,41 @@ import { remoteLog, flushRemoteLogs } from '../logging/remote_logger'
 // ==================== 主世界拦截器数据接收 ====================
 
 /**
+ * 主世界拦截器支持的消息类型集合
+ *
+ * 设计动机：
+ * - 拦截器现在拦截 3 类 API（Job/ChatList/ChatDetail），通过 type 字段区分
+ * - Content Script 用一个统一的 listener 分发，避免重复注册多个 message 监听器
+ * - 这里列出所有受支持的 type，便于类型收窄
+ */
+const SUPPORTED_CAPTURE_TYPES = [
+  'BOSS_JOB_DATA_CAPTURED',
+  'BOSS_CHAT_LIST_CAPTURED',
+  'BOSS_CHAT_DETAIL_CAPTURED',
+] as const
+
+type CapturedMessageType = (typeof SUPPORTED_CAPTURE_TYPES)[number]
+
+/**
  * 监听主世界拦截器发送的消息
  *
  * 主世界拦截器（interceptor.js）通过 registerContentScripts 注入，
  * 在页面 JS 执行前 hook fetch/XHR，捕获到数据后通过 postMessage 发送。
  * Content Script 在 isolated world 中监听 message 事件接收数据。
+ *
+ * 分发逻辑：
+ * - BOSS_JOB_DATA_CAPTURED → handleCapturedPayload（已有，职位列表解析）
+ * - BOSS_CHAT_LIST_CAPTURED → forwardChatCaptured（新增，转发给 SW）
+ * - BOSS_CHAT_DETAIL_CAPTURED → forwardChatCaptured（新增，转发给 SW）
+ *
+ * Chat 数据不在 Content Script 中解析，直接原样转发给 SW，
+ * 由 SW 调用 chat_api_parser 解析。原因：
+ * - Content Script 不持有 conversation store，无法做合并
+ * - SW 是数据汇聚点，适合做 API 列表 + DOM 消息的合并
  */
 window.addEventListener('message', (event: MessageEvent) => {
-  // 只处理 Boss 职位数据消息
-  if (event.data?.type !== 'BOSS_JOB_DATA_CAPTURED') {
+  const type = event.data?.type as string | undefined
+  if (!type || !SUPPORTED_CAPTURE_TYPES.includes(type as CapturedMessageType)) {
     return
   }
 
@@ -59,11 +85,18 @@ window.addEventListener('message', (event: MessageEvent) => {
 
   const capturedData = event.data.payload as CapturedApiPayload
 
-  remoteLog('info', '[postMessage] received job data from main world', {
-    url: capturedData.url?.slice(0, 120),
-  })
+  if (type === 'BOSS_JOB_DATA_CAPTURED') {
+    remoteLog('info', '[postMessage] received job data from main world', {
+      url: capturedData.url?.slice(0, 120),
+    })
+    handleCapturedPayload(capturedData)
+    return
+  }
 
-  handleCapturedPayload(capturedData)
+  // Chat 数据：转发给 SW，由 SW 解析
+  if (type === 'BOSS_CHAT_LIST_CAPTURED' || type === 'BOSS_CHAT_DETAIL_CAPTURED') {
+    forwardChatCaptured(type, capturedData)
+  }
 })
 
 /**
@@ -118,6 +151,41 @@ function handleCapturedPayload(payload: CapturedApiPayload): void {
   } catch (err) {
     remoteLog('error', 'Error parsing captured API data', { error: err instanceof Error ? err.message : String(err) })
   }
+}
+
+/**
+ * 转发 Chat API 拦截数据到 Service Worker
+ *
+ * 设计动机：
+ * - Content Script 不解析 Chat API 响应（解析责任在 SW）
+ * - 直接把拦截器原始 payload 转发，由 SW 调用 chat_api_parser 解析
+ * - 通过 ChromeMessageType 区分列表 vs 详情，SW 走不同 handler
+ *
+ * @param captureType 主世界拦截器的消息类型（BOSS_CHAT_LIST_CAPTURED / BOSS_CHAT_DETAIL_CAPTURED）
+ * @param captured 拦截器捕获的原始 payload
+ */
+function forwardChatCaptured(
+  captureType: 'BOSS_CHAT_LIST_CAPTURED' | 'BOSS_CHAT_DETAIL_CAPTURED',
+  captured: CapturedApiPayload,
+): void {
+  const messageType =
+    captureType === 'BOSS_CHAT_LIST_CAPTURED'
+      ? ChromeMessageType.CHAT_LIST_CAPTURED
+      : ChromeMessageType.CHAT_DETAIL_CAPTURED
+
+  remoteLog('info', `[postMessage] received chat data from main world (${captureType})`, {
+    url: captured.url?.slice(0, 120),
+    status: captured.status,
+  })
+
+  void sendMessageToBackground(messageType, {
+    url: captured.url,
+    method: captured.method,
+    status: captured.status,
+    data: captured.data,
+    headers: captured.headers,
+    pageUrl: window.location.href,
+  })
 }
 
 remoteLog('info', 'Content script started. Waiting for main world interceptor data via postMessage. Fallback: DOM extraction after timeout.')
@@ -347,6 +415,11 @@ function clearApiTimeout(): void {
  * - 清空已发送岗位去重器
  * - 清空当前选中岗位与列表页 URL
  * - 断开并重新挂载 adapter observer
+ *
+ * 页面类型分流：
+ * - 之前无条件调用 initListPage()，导致在聊天页时错误走列表页流程
+ * - 现在根据 chatAdapter.detect() 判断当前页面类型，调用对应的初始化函数
+ * - 列表页 → initListPage()；聊天页 → initChatPage()
  */
 function resetExtractionState(): void {
   clearApiTimeout()
@@ -355,9 +428,16 @@ function resetExtractionState(): void {
   currentSelectedDetailUrl = ''
   currentListPageUrl = window.location.href
   bossAdapter.disconnect()
-  initListPage()
 
-  remoteLog('info', '[content] RESET_EXTRACTION_STATE 完成，重新初始化列表页提取')
+  // 根据当前页面类型选择初始化函数
+  // chatAdapter.detect() 返回 'chat' 表示当前在 BOSS 聊天页
+  if (chatAdapter.detect() === 'chat') {
+    initChatPage()
+    remoteLog('info', '[content] RESET_EXTRACTION_STATE 完成，重新初始化聊天页提取')
+  } else {
+    initListPage()
+    remoteLog('info', '[content] RESET_EXTRACTION_STATE 完成，重新初始化列表页提取')
+  }
 }
 
 /**
@@ -530,16 +610,183 @@ function initListPage(): void {
 
 // ==================== 聊天页初始化 ====================
 
+/** 聊天页 DOM 就绪检测选择器（至少对话列表容器存在即可开始） */
+const CHAT_READY_SELECTOR = '.user-list-content'
+
+/** 聊天页 DOM 等待最大重试次数（每次 500ms，共 5s） */
+const CHAT_READY_MAX_RETRY = 10
+/** 聊天页 DOM 等待重试间隔（ms） */
+const CHAT_READY_RETRY_INTERVAL = 500
+
+/**
+ * 等待聊天页 DOM 就绪
+ *
+ * BOSS 直聘是 Vue SPA，聊天页内容是异步渲染的。
+ * content script 在 document_start 注入，但 .user-list-content 等元素
+ * 可能在 Vue 组件挂载后才出现在 DOM 中。
+ * 用轮询等待关键元素出现后再执行提取。
+ *
+ * @param callback DOM 就绪后的回调
+ * @param retryCount 当前重试次数
+ */
+function waitForChatDomReady(
+  callback: () => void,
+  retryCount = 0,
+): void {
+  const container = document.querySelector(CHAT_READY_SELECTOR)
+  if (container) {
+    // DOM 就绪，执行回调
+    console.log(`[AI Career Copilot] Chat DOM ready after ${retryCount} retries`)
+    callback()
+    return
+  }
+
+  if (retryCount >= CHAT_READY_MAX_RETRY) {
+    // 超时：DOM 仍未就绪，尝试用 MutationObserver 监听
+    console.warn(
+      `[AI Career Copilot] Chat DOM not ready after ${CHAT_READY_MAX_RETRY} retries, using MutationObserver fallback`,
+    )
+    waitForChatDomViaObserver(callback)
+    return
+  }
+
+  setTimeout(() => {
+    waitForChatDomReady(callback, retryCount + 1)
+  }, CHAT_READY_RETRY_INTERVAL)
+}
+
+/**
+ * MutationObserver 兜底：监听 DOM 变化等待关键元素出现
+ *
+ * 当轮询超时后，用 MutationObserver 监听 document.body 的子节点变化，
+ * 一旦 .user-list-content 出现就触发回调。
+ */
+function waitForChatDomViaObserver(callback: () => void): void {
+  // 先再检查一次（可能刚好在轮询超时和 observer 挂载之间出现）
+  const container = document.querySelector(CHAT_READY_SELECTOR)
+  if (container) {
+    callback()
+    return
+  }
+
+  let resolved = false
+  const observer = new MutationObserver(() => {
+    if (resolved) return
+    const el = document.querySelector(CHAT_READY_SELECTOR)
+    if (el) {
+      resolved = true
+      observer.disconnect()
+      console.log('[AI Career Copilot] Chat DOM ready via MutationObserver')
+      callback()
+    }
+  })
+
+  observer.observe(document.body, { childList: true, subtree: true })
+
+  // 10 秒超时，避免 observer 永久挂载
+  setTimeout(() => {
+    if (!resolved) {
+      resolved = true
+      observer.disconnect()
+      console.warn('[AI Career Copilot] Chat DOM observer timeout (10s), proceeding anyway')
+      callback()
+    }
+  }, 10000)
+}
+
 /**
  * 聊天页初始化逻辑
  *
  * 检测到 BOSS 聊天页时：
- * 1. 通知 SW 当前在聊天页
- * 2. 提取当前对话的消息 + 对话详情（公司、职位、薪资）
- * 3. 启动 MutationObserver 监听消息变化和对话切换
- * 4. 监听 SW 转发的注入指令
+ * 1. 等待 DOM 就绪（Vue SPA 异步渲染）
+ * 2. 通知 SW 当前在聊天页
+ * 3. 提取当前对话的消息 + 对话详情（公司、职位、薪资）
+ * 4. 启动 MutationObserver 监听消息变化和对话切换
+ * 5. 监听 SW 转发的注入指令
  */
 function initChatPage(): void {
+  // 通知 SW 当前页面状态（立即发送，不等 DOM）
+  void sendMessageToBackground(ChromeMessageType.PAGE_CHANGED, {
+    url: window.location.href,
+    isBossListPage: false,
+  })
+
+  // 等待 DOM 就绪后再执行提取
+  waitForChatDomReady(() => {
+    doInitChatPage()
+  })
+}
+
+/**
+ * 对话列表提取最大重试次数
+ *
+ * 设计动机:Vue SPA 异步渲染,.user-list-content 容器已存在但
+ * .friend-content 列表项可能还没渲染完。waitForChatDomReady 只等
+ * 容器出现,不等列表项。所以 extractConversations 可能返回空数组。
+ * 5 次 × 500ms = 2.5s,覆盖大多数 Vue 渲染延迟。
+ */
+const CONVERSATION_EXTRACT_MAX_RETRY = 5
+
+/** 对话列表提取重试间隔(ms) */
+const CONVERSATION_EXTRACT_RETRY_INTERVAL = 500
+
+/**
+ * 提取并发送对话列表(带重试)
+ *
+ * 场景:
+ * - Vue SPA 异步渲染,doInitChatPage 时 .friend-content 列表项可能未渲染完
+ * - extractConversations 返回空数组时不发送,避免 SW 缓存被空数据覆盖
+ * - 空数组时延迟重试,最多 5 次
+ * - 重试 5 次仍为空,放弃(依赖 chatAdapter.observe 的 MutationObserver 后续补发)
+ *
+ * 日志:每次重试都打印,便于调试 Vue 渲染时序问题
+ *
+ * @param retryCount 当前重试次数(内部递归用,外部调用不传)
+ */
+function extractAndSendConversations(retryCount = 0): void {
+  const conversations = chatAdapter.extractConversations()
+
+  if (conversations.length === 0) {
+    if (retryCount < CONVERSATION_EXTRACT_MAX_RETRY) {
+      console.log(
+        `[Content] extractConversations 返回空(retry=${retryCount}/${CONVERSATION_EXTRACT_MAX_RETRY}),` +
+          `延迟 ${CONVERSATION_EXTRACT_RETRY_INTERVAL}ms 重试(可能 .friend-content 列表项未渲染完)`,
+      )
+      setTimeout(
+        () => extractAndSendConversations(retryCount + 1),
+        CONVERSATION_EXTRACT_RETRY_INTERVAL,
+      )
+      return
+    }
+    console.warn(
+      '[Content] extractConversations 重试 5 次仍为空,放弃(依赖 chatAdapter.observe 的 MutationObserver 后续补发)',
+    )
+    return
+  }
+
+  // 提取成功,发送给 SW 缓存 + 广播到 SidePanel
+  void sendMessageToBackground(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, {
+    conversations: conversations.map((c) => ({
+      id: c.id,
+      recruiterName: c.recruiterName,
+      company: c.company,
+      lastMessage: c.lastMessage,
+      isActive: c.isActive,
+    })),
+    pageUrl: window.location.href,
+  })
+  console.log(
+    `[Content] extractAndSendConversations 成功 | count=${conversations.length} | retry=${retryCount}`,
+  )
+}
+
+/**
+ * 聊天页实际初始化逻辑（DOM 已就绪）
+ *
+ * 注意:对话列表提取带重试机制(见 extractAndSendConversations),
+ * 解决 Vue SPA 异步渲染导致 .friend-content 列表项延迟出现的问题。
+ */
+function doInitChatPage(): void {
   const recruiterName = chatAdapter.getActiveConversationName()
   const conversationId = `conv-${Date.now()}-${recruiterName}`
   const detail = chatAdapter.getConversationDetail()
@@ -553,12 +800,6 @@ function initChatPage(): void {
     detail?.jobTitle ?? '',
   )
 
-  // 通知 SW 当前页面状态（与列表页同级，让 SidePanel 知道在聊天页）
-  void sendMessageToBackground(ChromeMessageType.PAGE_CHANGED, {
-    url: window.location.href,
-    isBossListPage: false,
-  })
-
   // 通知 SW 当前在聊天页（含对话详情）
   void sendMessageToBackground(ChromeMessageType.CHAT_PAGE_DETECTED, {
     pageUrl: window.location.href,
@@ -567,6 +808,9 @@ function initChatPage(): void {
     jobTitle: detail?.jobTitle ?? '',
     jobSalary: detail?.jobSalary ?? '',
   })
+
+  // 提取并发送左侧对话列表（带重试,防止列表项异步渲染未完成）
+  extractAndSendConversations()
 
   // 初始提取消息
   const messages = chatAdapter.extractMessages()
@@ -618,6 +862,36 @@ function initChatPage(): void {
           jobSalary: newDetail?.jobSalary ?? '',
         })
       }, 600)
+    },
+    /**
+     * 对话列表变化回调(2026-07-21 修复)
+     *
+     * 触发场景:
+     * - Content Script 启动时 DOM 未渲染完,只拿到部分对话(或 0 个)
+     * - 后续 BOSS SPA 异步渲染完成,列表项增多
+     * - 用户翻页/搜索/筛选切换 HR 列表
+     *
+     * 修复的问题:
+     * - 原 observe() 不监听列表项变化,导致 Content Script 启动时拿到的 0 个对话永远无法补发
+     * - 现通过此回调重新提取并发送,让 SW + SidePanel 都能拿到最新列表
+     *
+     * 注:chatAdapter 内部已有签名对比 + 防抖,这里无需额外防抖
+     */
+    onConversationsListChanged: (conversations) => {
+      if (conversations.length === 0) return
+      console.log(
+        `[Content] onConversationsListChanged | count=${conversations.length} | 补发 CHAT_CONVERSATIONS_EXTRACTED`,
+      )
+      void sendMessageToBackground(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, {
+        conversations: conversations.map((c) => ({
+          id: c.id,
+          recruiterName: c.recruiterName,
+          company: c.company,
+          lastMessage: c.lastMessage,
+          isActive: c.isActive,
+        })),
+        pageUrl: window.location.href,
+      })
     },
   })
 }
@@ -755,6 +1029,36 @@ onMessage((message) => {
       currentSelectedDetailUrl = payload.sourceUrl
       const result = clickBossJobCard(payload.sourceUrl)
       return result
+    }
+    case ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED: {
+      // SidePanel 请求对话列表：等待 DOM 就绪后提取 + 直接回复 + 发送到 SW 缓存
+      return new Promise((resolve) => {
+        waitForChatDomReady(() => {
+          const conversations = chatAdapter.extractConversations()
+          void sendMessageToBackground(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, {
+            conversations: conversations.map((c) => ({
+              id: c.id,
+              recruiterName: c.recruiterName,
+              company: c.company,
+              lastMessage: c.lastMessage,
+              isActive: c.isActive,
+            })),
+            pageUrl: window.location.href,
+          })
+          resolve({
+            ok: true,
+            data: {
+              conversations: conversations.map((c) => ({
+                id: c.id,
+                recruiterName: c.recruiterName,
+                company: c.company,
+                lastMessage: c.lastMessage,
+                isActive: c.isActive,
+              })),
+            },
+          })
+        })
+      })
     }
     case ChromeMessageType.INJECT_CHAT_TEXT: {
       const payload = message.payload as { text: string }

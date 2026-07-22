@@ -47,6 +47,18 @@ import {
   type SessionState,
 } from './backend_client'
 import { bulkSet, getJobId, clear as clearSourceUrlMap } from './source_url_map'
+import {
+  parseChatListResponse,
+  parseChatDetailResponse,
+  mergeFriendsAndDetails,
+  isChatListUrl,
+  isChatDetailUrl,
+  type CapturedChatApiPayload,
+} from '../modules/boss/chat_api_parser'
+import type {
+  ApiChatFriend,
+  ApiChatFriendDetail,
+} from '../types/communication'
 
 // ==================== JOBS_EXTRACTED 并发锁 ====================
 
@@ -59,6 +71,36 @@ import { bulkSet, getJobId, clear as clearSourceUrlMap } from './source_url_map'
  * 解决：用 Promise 链串行化所有 JOBS_EXTRACTED 处理，同一时刻只有一个在执行。
  */
 let jobsExtractQueue: Promise<void> = Promise.resolve()
+
+// ==================== 聊天对话列表缓存 ====================
+
+/** 内存缓存：Content Script 提取的左侧对话列表（SidePanel 关闭后重开时用） */
+let cachedConversations: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED]['conversations'] = []
+
+/**
+ * Chat API 数据缓存（2026-07-21 新增）
+ *
+ * 设计动机：
+ * - geekFilterByLabel 和 getGeekFriendList.json 是两个独立请求，时序不固定
+ * - SW 需要等两个 API 都到达后才能合并出完整 ChatConversationItem[]
+ * - 用两个独立缓存分别保存，每次任一 API 到达都尝试合并并广播
+ *
+ * 生命周期：
+ * - 用户进入聊天页 → 两个 API 陆续到达 → 缓存填充 → 合并 → 广播
+ * - 用户离开聊天页 → 缓存保留（避免来回切换时重新拉取）
+ * - 用户登出 → 通过 RESET_EXTRACTION_STATE 清空
+ */
+let cachedChatFriends: ApiChatFriend[] = []
+let cachedChatDetails: ApiChatFriendDetail[] = []
+
+/**
+ * 标记 Chat API 是否已成功捕获过
+ *
+ * 用于 chat_adapter 的降级决策：
+ * - true → API 已生效，DOM 提取的对话列表可跳过（避免覆盖 API 数据）
+ * - false → API 未捕获，DOM 提取的对话列表作为兜底数据源
+ */
+let chatApiDataCaptured = false
 
 /** 请求间隔（ms），60 req/min = 1 req/sec，留 20% 余量 */
 const REQUEST_INTERVAL_MS = 1200
@@ -721,8 +763,9 @@ async function handleClearTokenCache(): Promise<ChromeMessageResponse> {
  * 1. 停止所有 task_poller 轮询
  * 2. 清空 source_url_map 内存与持久化映射
  * 3. 重置 backend_client 并发 promise 缓存
- * 4. 如需清空 sidepanel_state（登出场景）
- * 5. 向当前激活 Tab 的 Content Script 转发重置消息，让 CS 清空 apiDataCaptured / sentJobTracker
+ * 4. 清空 Chat API 数据缓存（friends/details/cachedConversations/apiCaptured 标记）
+ * 5. 如需清空 sidepanel_state（登出场景）
+ * 6. 向当前激活 Tab 的 Content Script 转发重置消息，让 CS 清空 apiDataCaptured / sentJobTracker
  */
 async function handleResetExtractionState(
   payload: ChromeMessagePayloadMap[typeof ChromeMessageType.RESET_EXTRACTION_STATE],
@@ -740,7 +783,31 @@ async function handleResetExtractionState(
   // 3. 重置 initSession / refresh 的并发 promise 缓存
   resetSessionPromises()
 
-  // 4. 如需清空 SidePanel 持久化状态（登出场景）
+  // 4. Chat 模块缓存清理策略
+  //
+  // keepChatCache=true：SidePanel 重开场景
+  // - 用户在 BOSS 聊天页打开过 SidePanel,Content Script 已经把 5 个对话发给 SW
+  // - 用户关闭 SidePanel 后再次打开,如果清空 cachedConversations,
+  //   就再也拿不到这些数据(Content Script 不会再次主动广播)
+  // - 因此 SidePanel 重开时只清 Job 提取状态,保留 Chat 缓存
+  //
+  // keepChatCache=false/undefined：登出/切换账号场景
+  // - 必须清空,避免新账号看到旧账号的 HR 列表(隐私 + 数据正确性)
+  // - 默认行为,向后兼容
+  const keepChatCache = payload.keepChatCache === true
+  if (!keepChatCache) {
+    console.log('[SW] RESET_EXTRACTION_STATE | 彻底清空 Chat 缓存(登出场景)')
+    cachedChatFriends = []
+    cachedChatDetails = []
+    cachedConversations = []
+    chatApiDataCaptured = false
+  } else {
+    console.log(
+      `[SW] RESET_EXTRACTION_STATE | 保留 Chat 缓存 | conversations=${cachedConversations.length} | friends=${cachedChatFriends.length} | details=${cachedChatDetails.length}`,
+    )
+  }
+
+  // 5. 如需清空 SidePanel 持久化状态（登出场景）
   if (payload.clearSidePanelStorage) {
     try {
       await chrome.storage.local.remove('sidepanel_state')
@@ -749,7 +816,7 @@ async function handleResetExtractionState(
     }
   }
 
-  // 5. 转发给当前激活 Tab 的 Content Script
+  // 6. 转发给当前激活 Tab 的 Content Script
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0]
@@ -1076,6 +1143,235 @@ async function handleChatDiagnose(
 }
 
 /**
+ * CHAT_CONVERSATIONS_EXTRACTED handler
+ *
+ * Content Script 从 BOSS 聊天页左侧 DOM 提取对话列表后发送
+ * SW 缓存到内存 + 广播给 SidePanel
+ *
+ * 与 Chat API 数据的关系（2026-07-21 新增）：
+ * - 若 chatApiDataCaptured=false（API 未拦截），DOM 提取的列表作为主数据源，直接覆盖缓存
+ * - 若 chatApiDataCaptured=true（API 已拦截），DOM 列表不覆盖 cachedConversations
+ *   但需要把 isActive 状态合并到 cachedConversations 中（API 不返回选中状态）
+ *
+ * 合并策略（API 已捕获场景）：
+ * - 按 recruiterName 匹配 DOM 项与 cachedConversations 项
+ * - 匹配成功的项：把 DOM 的 isActive 同步到 cachedConversations
+ * - DOM 中存在但 cachedConversations 没有的项：忽略（API 是更完整的数据源）
+ * - 广播合并后的 cachedConversations 给 SidePanel
+ */
+async function handleChatConversationsExtracted(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED],
+): Promise<ChromeMessageResponse> {
+  console.log(
+    `[SW] CHAT_CONVERSATIONS_EXTRACTED | count=${payload.conversations.length} | apiCaptured=${chatApiDataCaptured}`,
+  )
+
+  if (!chatApiDataCaptured) {
+    // API 未捕获：DOM 是主数据源，直接覆盖缓存
+    cachedConversations = payload.conversations
+    broadcastToSidePanel(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, payload)
+    return { ok: true }
+  }
+
+  // API 已捕获：DOM 不覆盖缓存，但合并 isActive 状态
+  // 用 DOM 的 isActive 更新 cachedConversations 中匹配项的选中状态
+  // Map key 为 recruiterName（DOM 拿不到 friendId，只能用姓名匹配）
+  const domActiveByName = new Map<string, boolean>()
+  for (const dom of payload.conversations) {
+    domActiveByName.set(dom.recruiterName, dom.isActive)
+  }
+
+  let activeChanged = false
+  for (const cached of cachedConversations) {
+    const newActive = domActiveByName.get(cached.recruiterName) ?? false
+    if (cached.isActive !== newActive) {
+      cached.isActive = newActive
+      activeChanged = true
+    }
+  }
+
+  // 只在 active 状态变化时才广播，避免高频无意义广播
+  if (activeChanged) {
+    console.log(
+      `[SW] DOM isActive 已合并到 API 数据，广播更新 | activeCount=${cachedConversations.filter((c) => c.isActive).length}`,
+    )
+    broadcastToSidePanel(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, {
+      conversations: cachedConversations,
+      pageUrl: payload.pageUrl,
+    })
+  }
+
+  return { ok: true }
+}
+
+/**
+ * REQUEST_CONVERSATIONS_LIST handler
+ *
+ * SidePanel 打开时主动拉取缓存的对话列表（解决广播丢失问题）
+ *
+ * 返回数据优先级：
+ * 1. 若 API 已捕获（cachedChatFriends + cachedChatDetails 合并），返回合并后的完整列表
+ * 2. 否则返回 DOM 提取的 cachedConversations
+ *
+ * 字段完整性：
+ * - API 数据优先时返回完整字段（jobTitle/jobId/unreadCount 等）
+ * - DOM 兜底时只有基础字段（id/recruiterName/company/lastMessage/isActive）
+ */
+async function handleRequestConversationsList(): Promise<ChromeMessageResponse> {
+  console.log(
+    `[SW] REQUEST_CONVERSATIONS_LIST | apiCaptured=${chatApiDataCaptured} | domCached=${cachedConversations.length} | apiFriends=${cachedChatFriends.length} | apiDetails=${cachedChatDetails.length}`,
+  )
+
+  // API 数据优先：若 friends 非空，合并后返回
+  if (chatApiDataCaptured && cachedChatFriends.length > 0) {
+    const merged = mergeFriendsAndDetails(cachedChatFriends, cachedChatDetails)
+    // 转换为 CHAT_CONVERSATIONS_EXTRACTED 的 payload 格式（保留完整 API 字段）
+    const conversations = merged.map((c) => ({
+      id: c.id,
+      recruiterName: c.recruiterName,
+      company: c.company ?? '',
+      lastMessage: c.lastMessage,
+      isActive: c.isActive ?? false, // API 不返回选中状态，由后续 CHAT_CONVERSATIONS_EXTRACTED 广播补全
+      // 完整 API 字段
+      recruiterJobTitle: c.recruiterJobTitle,
+      jobTitle: c.jobTitle,
+      jobId: c.jobId ?? null,
+      lastMessageAt: c.lastMessageAt ?? null,
+      unreadCount: c.unreadCount ?? 0,
+      messageCount: c.messageCount,
+    }))
+    return { ok: true, data: { conversations } }
+  }
+
+  // 兜底：DOM 提取的对话列表
+  return { ok: true, data: { conversations: cachedConversations } }
+}
+
+/**
+ * CHAT_LIST_CAPTURED handler（2026-07-21 新增）
+ *
+ * 数据来源：主世界拦截器捕获 GET /wapi/zprelation/friend/geekFilterByLabel
+ * Content Script 原样转发给 SW，SW 解析 zpData.friendList 为 ApiChatFriend[]
+ *
+ * 流程：
+ * 1. 校验 URL 是 geekFilterByLabel
+ * 2. 调用 parseChatListResponse 解析
+ * 3. 缓存到 cachedChatFriends
+ * 4. 标记 chatApiDataCaptured=true（API 已生效，后续 DOM 提取可降级）
+ * 5. 若 cachedChatDetails 也已就绪，合并并广播 CHAT_CONVERSATIONS_EXTRACTED
+ */
+async function handleChatListCaptured(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_LIST_CAPTURED],
+): Promise<ChromeMessageResponse> {
+  if (!isChatListUrl(payload.url)) {
+    console.warn(`[SW] CHAT_LIST_CAPTURED | URL mismatch: ${payload.url}`)
+    return { ok: false, error: 'URL 不是 geekFilterByLabel' }
+  }
+
+  const friends = parseChatListResponse(payload as CapturedChatApiPayload)
+  console.log(
+    `[SW] CHAT_LIST_CAPTURED | parsed friends=${friends.length} | url=${payload.url.slice(0, 100)}`,
+  )
+
+  if (friends.length === 0) {
+    return { ok: true, data: { count: 0 } }
+  }
+
+  cachedChatFriends = friends
+  chatApiDataCaptured = true
+
+  // 若详情也已缓存，合并并广播
+  broadcastMergedConversationsIfReady()
+
+  return { ok: true, data: { count: friends.length } }
+}
+
+/**
+ * CHAT_DETAIL_CAPTURED handler（2026-07-21 新增）
+ *
+ * 数据来源：主世界拦截器捕获 POST /wapi/zprelation/friend/getGeekFriendList.json
+ * Content Script 原样转发给 SW，SW 解析 zpData.result 为 ApiChatFriendDetail[]
+ *
+ * 流程：
+ * 1. 校验 URL 是 getGeekFriendList.json
+ * 2. 调用 parseChatDetailResponse 解析
+ * 3. 缓存到 cachedChatDetails
+ * 4. 若 cachedChatFriends 也已就绪，合并并广播 CHAT_CONVERSATIONS_EXTRACTED
+ */
+async function handleChatDetailCaptured(
+  payload: ChromeMessagePayloadMap[typeof ChromeMessageType.CHAT_DETAIL_CAPTURED],
+): Promise<ChromeMessageResponse> {
+  if (!isChatDetailUrl(payload.url)) {
+    console.warn(`[SW] CHAT_DETAIL_CAPTURED | URL mismatch: ${payload.url}`)
+    return { ok: false, error: 'URL 不是 getGeekFriendList.json' }
+  }
+
+  const details = parseChatDetailResponse(payload as CapturedChatApiPayload)
+  console.log(
+    `[SW] CHAT_DETAIL_CAPTURED | parsed details=${details.length} | url=${payload.url.slice(0, 100)}`,
+  )
+
+  if (details.length === 0) {
+    return { ok: true, data: { count: 0 } }
+  }
+
+  cachedChatDetails = details
+
+  // 若 friends 也已缓存，合并并广播
+  broadcastMergedConversationsIfReady()
+
+  return { ok: true, data: { count: details.length } }
+}
+
+/**
+ * 合并 cachedChatFriends + cachedChatDetails 并广播到 SidePanel
+ *
+ * 触发条件：friends 和 details 都非空时才合并
+ * 设计动机：两个 API 时序不固定，每次任一到达都尝试合并，
+ * 保证最后一个 API 到达时 SidePanel 能拿到完整数据
+ *
+ * 字段完整性：
+ * - 直接使用 mergeFriendsAndDetails 输出的完整 ChatConversationItem[]
+ * - 包含 jobTitle/jobId/recruiterJobTitle/lastMessageAt/unreadCount 等 API 字段
+ * - isActive 默认 false（API 不返回选中状态）
+ * - 后续由 handleChatConversationsExtracted 合并 DOM 的 isActive 状态
+ */
+function broadcastMergedConversationsIfReady(): void {
+  if (cachedChatFriends.length === 0 || cachedChatDetails.length === 0) {
+    return
+  }
+
+  const conversations = mergeFriendsAndDetails(cachedChatFriends, cachedChatDetails)
+
+  // 更新 cachedConversations，让后续 REQUEST_CONVERSATIONS_LIST 也能返回 API 数据
+  // 注意：conversations 是 ChatConversationItem[]，与 payload 类型兼容（多余字段不影响类型校验）
+  cachedConversations = conversations.map((c) => ({
+    id: c.id,
+    recruiterName: c.recruiterName,
+    company: c.company ?? '',
+    lastMessage: c.lastMessage,
+    isActive: c.isActive ?? false,
+    // API 合并的完整字段，广播给 SidePanel 用于渲染详情
+    recruiterJobTitle: c.recruiterJobTitle,
+    jobTitle: c.jobTitle,
+    jobId: c.jobId ?? null,
+    lastMessageAt: c.lastMessageAt ?? null,
+    unreadCount: c.unreadCount ?? 0,
+    messageCount: c.messageCount,
+  }))
+
+  console.log(
+    `[SW] Chat API 合并完成 | merged=${conversations.length} | 广播到 SidePanel`,
+  )
+
+  // 广播到 SidePanel（复用 CHAT_CONVERSATIONS_EXTRACTED 消息类型，避免新增广播类型）
+  broadcastToSidePanel(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, {
+    conversations: cachedConversations,
+    pageUrl: 'api-merged', // 标识来源为 API 合并（区别于 DOM 提取）
+  })
+}
+
+/**
  * CHAT_MESSAGES_EXTRACTED handler
  *
  * Content Script 从聊天页提取消息后发送，SW 同步到后端并广播给 SidePanel
@@ -1296,6 +1592,10 @@ export function initMessageRouter(): () => void {
   registerHandler(ChromeMessageType.RESUME_DELETE, handleResumeDelete)
   registerHandler(ChromeMessageType.CHAT_PAGE_DETECTED, handleChatPageDetected)
   registerHandler(ChromeMessageType.CHAT_DIAGNOSE, handleChatDiagnose)
+  registerHandler(ChromeMessageType.CHAT_CONVERSATIONS_EXTRACTED, handleChatConversationsExtracted)
+  registerHandler(ChromeMessageType.REQUEST_CONVERSATIONS_LIST, handleRequestConversationsList)
+  registerHandler(ChromeMessageType.CHAT_LIST_CAPTURED, handleChatListCaptured)
+  registerHandler(ChromeMessageType.CHAT_DETAIL_CAPTURED, handleChatDetailCaptured)
   registerHandler(ChromeMessageType.CHAT_MESSAGES_EXTRACTED, handleChatMessagesExtracted)
   registerHandler(ChromeMessageType.CHAT_CONVERSATION_CHANGED, handleChatConversationChanged)
   registerHandler(ChromeMessageType.REQUEST_CHAT_REPLY, handleRequestChatReply)
